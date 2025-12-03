@@ -194,7 +194,7 @@ def custom_train_detector(
             time.ctime().replace(" ", "_").replace(":", "_"),
         )
         eval_hook = CustomDistEvalHook if distributed else EvalHook
-        runner.register_hook(eval_hook(val_dataloader, **eval_cfg))
+        runner.register_hook(eval_hook(val_dataloader, **eval_cfg), priority='LOW')
 
     # user-defined hooks
     if cfg.get("custom_hooks", None):
