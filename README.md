@@ -7,7 +7,7 @@
 
 <sup>1</sup> East China University of Science and Technology， <sup>2</sup> SenseAuto Research, <sup>3</sup> The University of Sydney
 
-![DistillDrive](https://img.shields.io/badge/CVF-Open%20Access-2b9348.svg?logo=readthedocs)&nbsp;
+[![DistillDrive](https://img.shields.io/badge/CVF-Open%20Access-2b9348.svg?logo=readthedocs)](https://openaccess.thecvf.com/content/ICCV2025/html/Yu_DistillDrive_End-to-End_Multi-Mode_Autonomous_Driving_Distillation_by_Isomorphic_Hetero-Source_Planning_ICCV_2025_paper.html)&nbsp;
 [![DistillDrive](https://img.shields.io/badge/Paper-DistillDrive-2b9348.svg?logo=arXiv)](https://arxiv.org/abs/2508.05402)&nbsp;
 [![huggingface weights](https://img.shields.io/badge/%F0%9F%A4%97%20Weights-DistillDrive-yellow)](https://huggingface.co/RuiYuStudying/DistillDrive/tree/main)&nbsp;
 
