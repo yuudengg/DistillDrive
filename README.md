@@ -21,8 +21,7 @@
 * **` Sep. 7th, 2025`:** We reorganize code for better readability. Code & Models are released.
 * **`Aug. 08, 2025`:** We release the SparseDrive paper on [arXiv](https://arxiv.org/abs/2508.05402). 
 * **`Jun. 26, 2025`:** DistillDrive is accepted to ICCV 2025!
-* **Oct. 23, 2025:** DistillDrive is published at ICCV 2025 on CVF Open Access.  
-  [Paper](https://openaccess.thecvf.com/content/ICCV2025/html/Yu_DistillDrive_End-to-End_Multi-Mode_Autonomous_Driving_Distillation_by_Isomorphic_Hetero-Source_Planning_ICCV_2025_paper.html)
+* **Oct. 23, 2025:** DistillDrive is published at ICCV 2025 on CVF Open Access [Paper](https://openaccess.thecvf.com/content/ICCV2025/html/Yu_DistillDrive_End-to-End_Multi-Mode_Autonomous_Driving_Distillation_by_Isomorphic_Hetero-Source_Planning_ICCV_2025_paper.html)!
 
 ## Introduction
 > We introduce DistillDrive, an end-to-end knowledge distillation-based autonomous driving model that leverages diversified instance imitation to enhance multi-mode motion feature learning
