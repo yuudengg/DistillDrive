@@ -95,3 +95,15 @@ https://huggingface.co/RuiYuStudying/DistillDrive/blob/main/demo.mp4
 - [StreamMapNet](​https://github.com/yuantianyuan01/StreamMapNet)
 - [mmdet3d](​https://github.com/open-mmlab/mmdetection3d)
 
+## Citation
+If you find DistillDrive is useful in your research or applications, please consider giving us a star 🌟 and citing it by the following BibTeX entry.
+
+```bibtex
+@inproceedings{yu2025distilldrive,
+  title={Distilldrive: End-to-end multi-mode autonomous driving distillation by isomorphic hetero-source planning model},
+  author={Yu, Rui and Zhang, Xianghang and Zhao, Runkai and Yan, Huaicheng and Wang, Meng},
+  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  pages={26188--26197},
+  year={2025}
+}
+```
