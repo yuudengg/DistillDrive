@@ -1,4 +1,5 @@
 from .motion_planning_head import MotionPlanningHead
+from .sparse_query_motion_planning_head import SparseQueryMotionPlanningHead
 from .motion_blocks import MotionPlanningRefinementModule
 from .instance_queue import InstanceQueue
 from .target import MotionTarget, PlanningTarget
