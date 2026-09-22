@@ -1,0 +1,25 @@
+name: distilldrive
+
+services:
+  workspace:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${DISTILLDRIVE_BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}
+    image: ${DISTILLDRIVE_IMAGE:-distilldrive:gb10}
+    gpus: all
+    ipc: host
+    stdin_open: true
+    tty: true
+    working_dir: /workspace/DistillDrive
+    environment:
+      HOME: /tmp/distilldrive-home
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      PYTHONPATH: /workspace/DistillDrive
+    volumes:
+      - ./data:/workspace/DistillDrive/data
+      - ./checkpoint:/workspace/DistillDrive/checkpoint
+      - ./work_dirs:/workspace/DistillDrive/work_dirs
+      - ./vis:/workspace/DistillDrive/vis
+    command: bash

@@ -1,0 +1,10 @@
+data/
+checkpoint/
+work_dirs/
+vis/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.so
+**/build/
+**/*.egg-info/

@@ -1,0 +1,29 @@
+# Versions pinned for the NVIDIA GB10 (Blackwell, ARM64) Docker image, built on
+# nvcr.io/nvidia/pytorch:26.07-py3 (Python 3.12, torch 2.13.0a0, CUDA 13.3).
+# The upstream pins in requirement.txt / docs/install.md (torch 1.13+cu116,
+# Python 3.8) do not install on this hardware; these are the closest
+# installable equivalents.
+# See docker/requirements-gb10.txt, Dockerfile, and README.docker.md.
+numpy==1.26.4
+mmcv==1.7.1           # plain mmcv (not mmcv_full): native ops are stubbed, see docker/mmcv_ext_stub.py
+mmdet==2.28.2
+urllib3==1.26.20
+pyquaternion==0.9.9
+nuscenes-devkit==1.1.11
+yapf==0.33.0
+tensorboard==2.20.0
+motmetrics==1.4.0
+pandas==2.2.3
+flash-attn==2.7.4.post1  # provided prebuilt by the base image; not pip-installed separately
+opencv-python-headless==4.10.0.84
+prettytable==3.16.0
+scikit-learn==1.6.1
+
+# Transitive deps normally pulled in by mmcv/mmdet/nuscenes-devkit, listed
+# explicitly because the Docker build installs those three with --no-deps.
+addict==2.4.0
+cachetools==5.5.2
+descartes==1.1.0
+fire==0.7.1
+shapely==2.0.7
+terminaltables==3.1.10

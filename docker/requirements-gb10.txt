@@ -1,0 +1,18 @@
+# The upstream pins predate Python 3.12 and NVIDIA GB10. Keep the OpenMMLab
+# API generation, while selecting versions that still install on Python 3.12.
+numpy==1.26.4
+urllib3==1.26.20
+pyquaternion==0.9.9
+yapf==0.33.0
+tensorboard==2.20.0
+motmetrics==1.4.0
+opencv-python-headless==4.10.0.84
+pandas==2.2.3
+prettytable==3.16.0
+scikit-learn==1.6.1
+addict==2.4.0
+cachetools==5.5.2
+descartes==1.1.0
+fire==0.7.1
+shapely==2.0.7
+terminaltables==3.1.10

@@ -1,0 +1,13 @@
+.git
+.gitignore
+checkpoint/**
+data/**
+work_dirs/**
+vis/**
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.so
+**/build
+**/*.egg-info
+
