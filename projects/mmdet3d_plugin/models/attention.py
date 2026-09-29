@@ -86,7 +86,7 @@ class FlashAttention(nn.Module):
             cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
                                     device=q.device)
             x = rearrange(kv, 'b s two h d -> b s (two h d)')
-            x_unpad, indices, cu_seqlens_k, max_sk = unpad_input(x, key_padding_mask)
+            x_unpad, indices, cu_seqlens_k, max_sk, *_ = unpad_input(x, key_padding_mask)
             x_unpad = rearrange(x_unpad, 'nnz (two h d) -> nnz two h d', two=2, h=nheads)
             output_unpad = flash_attn_unpadded_kvpacked_func(
                 q, x_unpad, cu_seqlens_q, cu_seqlens_k, max_sq, max_sk,
@@ -94,6 +94,9 @@ class FlashAttention(nn.Module):
                 softmax_scale=self.softmax_scale, causal=causal
             )
             output = rearrange(output_unpad, '(b s) ... -> b s ...', b=batch_size)
+
+        # Guard against NaN/inf leaking out of the fp16 flash-attn kernels.
+        output = torch.nan_to_num(output, nan=0.0, posinf=0.0, neginf=0.0)
 
         return output, None
 

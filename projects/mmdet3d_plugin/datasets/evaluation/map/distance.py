@@ -51,8 +51,19 @@ def chamfer_distance_batch(pred_lines, gt_lines):
         pred_lines = torch.tensor(pred_lines)
     if not isinstance(gt_lines, torch.Tensor):
         gt_lines = torch.tensor(gt_lines)
-    dist_mat = torch.cdist(pred_lines.view(-1, coord_dims), 
-                    gt_lines.view(-1, coord_dims), p=2) 
+    # float64 cdist on CPU is far slower here than float32 (larger temporaries,
+    # no fast GEMM path); thresholds are meters, so float32 precision is fine.
+    pred_lines = pred_lines.float()
+    gt_lines = gt_lines.float()
+    import time as _time
+    _t0 = _time.time()
+    dist_mat = torch.cdist(pred_lines.view(-1, coord_dims),
+                    gt_lines.view(-1, coord_dims), p=2)
+    _dt = _time.time() - _t0
+    if _dt > 0.05:
+        import os, sys
+        with open('/workspace/DistillDrive/work_dirs/slow_calls.log', 'a') as _f:
+            _f.write(f"pid={os.getpid()} npred={pred_lines.shape[0]} ngt={gt_lines.shape[0]} num_pts={num_pts} dt={_dt:.3f}\n")
     # (num_query*num_points, num_gt*num_points)
     dist_mat = torch.stack(torch.split(dist_mat, num_pts)) 
     # (num_query, num_points, num_gt*num_points)
