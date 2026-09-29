@@ -17,7 +17,9 @@ num_epochs = 100
 checkpoint_epoch_interval = 100
 
 checkpoint_config = dict(
-    interval=num_iters_per_epoch * checkpoint_epoch_interval
+    # Checkpoint every 1000 iters (not just at the very end) so a crash
+    # partway through this ~100-epoch run doesn't lose all progress.
+    interval=1000
 )
 log_config = dict(
     interval=51,
@@ -29,7 +31,7 @@ log_config = dict(
 load_from = None
 resume_from = None
 workflow = [("train", 1)]
-fp16 = dict(loss_scale=32.0)
+fp16 = dict(loss_scale='dynamic')  # was fixed 32.0: no overflow detection, let inf/nan grads corrupt weights silently
 input_shape = (704, 256)
 
 
@@ -683,7 +685,7 @@ data = dict(
 # ================== training ========================
 optimizer = dict(
     type="AdamW",
-    lr=4e-4,
+    lr=5e-5,  # was 4e-4 (tuned for total batch 64); scaled by 8/64 for our batch 8
     weight_decay=0.001,
     paramwise_cfg=dict(
         custom_keys={

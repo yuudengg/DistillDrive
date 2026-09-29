@@ -202,9 +202,17 @@ class InstanceBank(nn.Module):
     ):
         if self.num_temp_instances <= 0:
             return
-        instance_feature = instance_feature.detach()
-        anchor = anchor.detach()
-        confidence = confidence.detach()
+        # The cache is detached, so it is invisible to fp16 grad-overflow
+        # checks; a single NaN/inf here would otherwise persist across frames.
+        instance_feature = torch.nan_to_num(
+            instance_feature.detach(), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        anchor = torch.nan_to_num(
+            anchor.detach(), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        confidence = torch.nan_to_num(
+            confidence.detach(), nan=-1e4, posinf=1e4, neginf=-1e4
+        )
 
         self.metas = metas
         confidence = confidence.max(dim=-1).values.sigmoid()

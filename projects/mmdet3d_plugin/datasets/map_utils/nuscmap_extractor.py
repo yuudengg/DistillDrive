@@ -53,7 +53,6 @@ class NuscMapExtractor(object):
             return rect_v[longest_v_i], v_len[longest_v_i]
 
         tree = strtree.STRtree(ped_geoms)
-        index_by_id = dict((id(pt), i) for i, pt in enumerate(ped_geoms))
 
         final_pgeom = []
         remain_idx = [i for i in range(len(ped_geoms))]
@@ -66,11 +65,14 @@ class NuscMapExtractor(object):
             pgeom_v, pgeom_v_norm = get_rec_direction(pgeom)
             final_pgeom.append(pgeom)
 
-            for o in tree.query(pgeom):
-                o_idx = index_by_id[id(o)]
+            # shapely >= 2.0: STRtree.query() returns integer indices into
+            # ped_geoms, not geometry objects (shapely 1.x behavior).
+            for o_idx in tree.query(pgeom):
+                o_idx = int(o_idx)
                 if o_idx not in remain_idx:
                     continue
 
+                o = ped_geoms[o_idx]
                 o_v, o_v_norm = get_rec_direction(o)
                 cos = pgeom_v.dot(o_v)/(pgeom_v_norm*o_v_norm)
                 if 1 - np.abs(cos) < 0.01:  # theta < 8 degrees.

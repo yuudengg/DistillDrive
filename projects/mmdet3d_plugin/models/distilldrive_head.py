@@ -55,7 +55,10 @@ class DistillDriveHead(BaseModule):
         feature_maps: Union[torch.Tensor, List],
         metas: dict,
     ):
-        if self.task_config['with_distillation']:
+        run_teacher = self.task_config['with_distillation'] and (
+            self.training or not self.task_config['with_motion_plan']
+        )
+        if run_teacher:
             motion_tc, planning_tc = self.distillation_head(metas)
         else:
             motion_output, planning_output = None, None
@@ -83,7 +86,7 @@ class DistillDriveHead(BaseModule):
                 self.det_head.instance_bank.anchor_handler,
             )
 
-            if self.task_config['with_distillation']:
+            if run_teacher:
                 planning_output['teacher_classification'] = planning_tc['classification']
                 planning_output['teacher_prediction'] = planning_tc['prediction']
                 planning_output['teacher_encoder_feature'] = planning_tc['encoder_feature']

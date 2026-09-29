@@ -12,8 +12,20 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+# Purely informational calls (env logging via mmdet.utils.collect_env, etc.)
+# that mmdet's own startup code invokes regardless of whether any actual
+# mmcv.ops kernel is used. Safe to answer with a placeholder instead of
+# raising, since no computation depends on the result.
+_INFO_ONLY = {
+    "get_compiler_version": lambda: "n/a (mmcv native ops unavailable on GB10)",
+    "get_compiling_cuda_version": lambda: "n/a (mmcv native ops unavailable on GB10)",
+}
+
 
 def __getattr__(name: str) -> Callable[..., Any]:
+    if name in _INFO_ONLY:
+        return _INFO_ONLY[name]
+
     def unavailable(*args: Any, **kwargs: Any) -> Any:
         del args, kwargs
         raise RuntimeError(
