@@ -116,6 +116,12 @@ class AgentEncoder(nn.Module):
         agent_hs = self.agent_time_embed(agent_hs) # [N_Valid, T, D], for time position embeding
         key_padding_mask = agent_time_mask_vec[agent_valid_mask] # [N_Valid, T]
         N_valid, _ = key_padding_mask.shape
+        if N_valid == 0:
+            return (
+                torch.zeros(bs, n_agent, self.agent_dim, device=agent_feature.device),
+                torch.zeros(bs, n_agent, self.agent_dim, device=agent_feature.device),
+                ~agent_valid_mask,
+            )
         
         agent_hs = self.agent_feat_embed(
             src=agent_hs, 

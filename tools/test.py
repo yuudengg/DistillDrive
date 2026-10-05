@@ -5,6 +5,13 @@ import os
 from os import path as osp
 
 import torch
+# Map evaluation later forks a multiprocessing.Pool (vector_eval.py). If torch's
+# OpenMP thread pool has already spun up multiple threads by then (from earlier
+# GPU-inference CPU-side ops), the forked children inherit a stale OpenMP barrier
+# waiting on threads that don't exist in the child, so any parallelized CPU op
+# (e.g. cdist) spins forever in sched_yield. Keeping torch single-threaded for
+# this whole process for the whole run avoids that fork/OpenMP interaction.
+torch.set_num_threads(1)
 import warnings
 from mmcv import Config, DictAction
 from mmcv.cnn import fuse_conv_bn
@@ -104,7 +111,7 @@ def parse_args():
         default="none",
         help="job launcher",
     )
-    parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument("--local_rank", "--local-rank", type=int, default=0)
     parser.add_argument("--result_file", type=str, default=None)
     parser.add_argument("--show_only", action="store_true")
     args = parser.parse_args()
@@ -220,6 +227,8 @@ def main():
 
     # build the dataloader
     dataset = build_dataset(cfg.data.test)
+    if os.environ.get('DBG_START'):
+        dataset.data_infos = dataset.data_infos[int(os.environ['DBG_START']):]
     print("distributed:", distributed)
     if distributed:
         data_loader = build_dataloader(
