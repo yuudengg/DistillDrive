@@ -460,29 +460,28 @@ class MotionPlanningHead(BaseModule):
                     key_pos=map_anchor_embed_selected,
                 )  # [B, N1 + M_E, D]
             elif op == "refine":
-                # get motion and planing feature
-                motion_query = motion_mode_pos + (instance_feature + anchor_embed)[:, :num_anchor].unsqueeze(2) # [B, N1, MA, D]
-                plan_query = plan_mode_pos + (instance_feature + anchor_embed)[:, num_anchor:].unsqueeze(1) # [B, 1, ME, D] 
-                # Only get one Status, Must to commperss in MultiModal
-                ego_feature = self.ego_feature_avp(instance_feature[:, num_anchor:].permute(0, 2, 1)).permute(0, 2, 1) # [B, 1, D]
-                ego_anchor_embed = self.ego_pos_avp(anchor_embed[:, num_anchor:].permute(0, 2, 1)).permute(0, 2, 1)  # [B, 1, D]
-                # Need to update Memory Bank
+                # 1st pass (cond=None): identical to the original refine block
                 (
                     motion_cls,
                     motion_reg,
                     plan_cls,
                     plan_reg,
                     plan_status,
-                ) = self.layers[i](
-                    motion_query,
                     plan_query,
-                    ego_feature,
-                    ego_anchor_embed,
+                ) = self._refine_once(
+                    i,
+                    instance_feature,
+                    anchor_embed,
+                    num_anchor,
+                    motion_mode_pos,
+                    plan_mode_pos,
+                    plan_anchor_delta,
+                    cond=None,
                 )
-                # anchor + offset schedule
-                if self.pred_delta:
-                    plan_delta = plan_anchor_delta.clone().flatten(1, 2).unsqueeze(1) # [B, 1, ME, T2, 2]
-                    plan_reg = plan_reg + plan_delta
+                # TODO(STEP 2): feedback 2nd pass, refine only (no gnn / VAE re-run)
+                # if self.use_feedback:
+                #     cond = self.adaln(...)  # meta-action -> condition
+                #     (...) = self._refine_once(..., cond=cond)
                 motion_classification.append(motion_cls)
                 motion_prediction.append(motion_reg)
                 planning_classification.append(plan_cls)
@@ -514,6 +513,47 @@ class MotionPlanningHead(BaseModule):
             planning_output["distribution"] = output_distribution
 
         return motion_output, planning_output
+
+    def _refine_once(
+        self,
+        i,
+        instance_feature,
+        anchor_embed,
+        num_anchor,
+        motion_mode_pos,
+        plan_mode_pos,
+        plan_anchor_delta,
+        cond=None,
+    ):
+        """Run the refine block once (plan B: refine only, no gnn / VAE).
+
+        cond is reserved for the feedback (adaLN) 2nd pass and is unused for now,
+        so with cond=None the output is identical to the original refine block.
+        """
+        # get motion and planing feature
+        motion_query = motion_mode_pos + (instance_feature + anchor_embed)[:, :num_anchor].unsqueeze(2) # [B, N1, MA, D]
+        plan_query = plan_mode_pos + (instance_feature + anchor_embed)[:, num_anchor:].unsqueeze(1) # [B, 1, ME, D]
+        # Only get one Status, Must to commperss in MultiModal
+        ego_feature = self.ego_feature_avp(instance_feature[:, num_anchor:].permute(0, 2, 1)).permute(0, 2, 1) # [B, 1, D]
+        ego_anchor_embed = self.ego_pos_avp(anchor_embed[:, num_anchor:].permute(0, 2, 1)).permute(0, 2, 1)  # [B, 1, D]
+        # Need to update Memory Bank
+        (
+            motion_cls,
+            motion_reg,
+            plan_cls,
+            plan_reg,
+            plan_status,
+        ) = self.layers[i](
+            motion_query,
+            plan_query,
+            ego_feature,
+            ego_anchor_embed,
+        )
+        # anchor + offset schedule
+        if self.pred_delta:
+            plan_delta = plan_anchor_delta.clone().flatten(1, 2).unsqueeze(1) # [B, 1, ME, T2, 2]
+            plan_reg = plan_reg + plan_delta
+        return motion_cls, motion_reg, plan_cls, plan_reg, plan_status, plan_query
 
     def get_future_state(self, gt_ego_fut_trajs, gt_ego_fut_masks, gt_agent_fut_trajs, gt_agent_fut_masks, gt_labels_3d):
 
