@@ -5,7 +5,7 @@
 ## 1. 한 줄 설계
 
 주행 모델이 만든 **언어 패킷**(ego·주변 객체·지도 토큰 약 20개 + 선택된 궤적 + 메타행동)을 디스크에 저장해 두고,
-언어팀은 그 패킷만으로 **Qwen2.5 + 투영기(projector)** 를 학습해 "왜 그렇게 가는지" 한 문장을 만든다.
+언어팀은 그 패킷만으로 **Qwen1.5-1.8B-Chat(8bit + LoRA) + 투영기(projector)** 를 학습해 "왜 그렇게 가는지" 한 문장을 만든다.
 주행 모델은 건드리지 않으므로 기존 학습·평가 결과는 그대로다.
 
 ```
@@ -16,9 +16,9 @@
    ├─ 토큰 선택: ego(1) + agent(K) + map(M)           ReasonPacketDataset
    └─ LangPacketBuilder ─→ lang_packet ──저장──►      LanguageHead
                                                        ├ SceneProjector (256 → LM dim)
- (되먹임 adaLN 가지는 별도, 같은 meta-action 사용)        ├ Qwen2.5-1.5B (동결, 단계 2에서 LoRA)
+ (되먹임 adaLN 가지는 별도, 같은 meta-action 사용)        ├ Qwen1.5-1.8B-Chat (동결, 단계 2에서 8bit + LoRA)
                                                        └ 입력 = [프롬프트 | 장면 토큰 | 메타행동 문장 | Reason:] → 근거 문장
- 라벨(오프라인): Qwen2.5-VL(카메라 영상 + GT 메타행동) → reasons.jsonl   ← 학습용 모델과 다른 모델
+ 라벨(오프라인): Qwen2.5-VL-7B 또는 3B(카메라 영상 + GT 메타행동) → reasons.jsonl   ← 학습용 모델과 다른 모델
 ```
 
 ## 2. 왜 이렇게 나눴나
@@ -26,11 +26,11 @@
 | 결정 | 이유 |
 | --- | --- |
 | 패킷을 디스크에 캐시 | 언어팀은 GPU를 직접 못 씀. GPU 담당이 패킷을 **한 번만** 뽑아 주면 이후 작업은 CPU 디버깅 + 짧은 GPU 학습으로 가능 |
-| 주행 모델 forward 안에서 LM 호출 안 함 | 3B 모델이 평가 속도·메모리·재현성에 영향을 주지 않게 하려고. `lang_packet_cfg=None`이면 코드 경로 자체가 꺼짐 |
+| 주행 모델 forward 안에서 LM 호출 안 함 | LM이 평가 속도·메모리·재현성에 영향을 주지 않게 하려고. `lang_packet_cfg=None`이면 코드 경로 자체가 꺼짐 |
 | 패킷은 detach | 언어 loss가 궤적 성능을 건드리지 않음 (나중에 end-to-end가 필요하면 그때 열면 됨) |
 | 장면 토큰은 약 20개 | SparseDrive의 희소 인스턴스 표현을 그대로 활용. BEV 전체를 넣는 것보다 가볍고 빠름 |
 | 메타행동은 규칙(MetaActionHead) | 학습 파라미터 0. 프롬프트에 **텍스트로** 넣어 줘서 LM이 "무슨 행동의 이유인지" 알고 이유만 생성 |
-| 라벨 모델 ≠ 학습 모델 | Qwen2.5-VL이 영상을 보고 라벨 작성 → Qwen2.5-1.5B가 장면 토큰만 보고 같은 근거를 재현하도록 학습 (지식 증류와 같은 구도) |
+| 라벨 모델 ≠ 학습 모델 | Qwen2.5-VL이 영상을 보고 라벨 작성 → Qwen1.5-1.8B-Chat이 장면 토큰만 보고 같은 근거를 재현하도록 학습 (지식 증류와 같은 구도) |
 | 2단계 학습 | 1단계: 투영기만 (LM 동결) → 2단계: 투영기 + LoRA. 1단계만으로도 파이프라인이 도는지 먼저 확인 가능 |
 
 ## 3. 파일 목록
@@ -42,33 +42,29 @@ projects/mmdet3d_plugin/models/language/        (새 폴더)
   projector.py      SceneProjector: 장면 토큰 + 궤적 토큰 → LM 임베딩
   language_head.py  LanguageHead: 입력 조립, loss(근거 토큰만), generate, save/load, LoRA
   dataset.py        ReasonPacketDataset, collate_fn
+  meta_spec.py      메타행동 번호 체계 (문서 순서 좌/직/우) + meta_action.py 순서와의 변환
+  output_parser.py  LM 출력 형식(`Meta-action: ...` 다음 줄 `Reason: ...`)과 파서
+  language_module.py  C 인터페이스: build_language_module, infer, Mock/HF 모듈 (7장)
   tiny.py           CPU 디버그용 작은 랜덤 Qwen2 + 토크나이저 (다운로드 없음)
   __init__.py
 tools/language/
   _compat.py              mmcv 없이도 실제 meta_action.py를 불러오는 도우미
   make_meta_action_gt.py  GT 궤적 → 12클래스 메타행동 + 분포 (README 확인 #2)  ← CPU
-  gen_reason_labels.py    Qwen2.5-VL로 근거 라벨 생성                           ← GPU
+  gen_reason_labels.py    Qwen2.5-VL(3B/7B)로 근거 라벨 생성                    ← GPU
   train_language.py       단계 1/2 학습                                          ← GPU (--tiny는 CPU)
   eval_language.py        생성 품질 + 1차 궤적 메타행동 정확도                    ← GPU
-tests/language/test_language_pipeline.py   CPU 스모크 테스트
-patches/apply_language_patch.py            motion_planning_head.py에 25줄 추가 (줄바꿈 CRLF/LF 그대로 유지, 권장)
-patches/language_packet_hook.patch         같은 변경의 diff (참고용)
+tests/language/   CPU 테스트 3개 (pipeline, language_module, hf_language_module)
 ```
+주행 모델 쪽 연결(`motion_planning_head.py`에 패킷 hook 추가)은 파일 소유권 규칙에 따라 A가 적용한다 (패치는 A에게 따로 전달).
 
 ## 4. 적용 순서
 
 필요 패키지: `torch`(패킷 덤프는 1.x에서도 동작, 언어모델 학습은 2.x 기준으로 확인), `transformers`(Qwen2.5-VL은 4.49 이상), `peft`(단계 2 LoRA), `accelerate`(device_map 사용 시), 라벨 생성에는 `pillow`.
 
-### 0) 파일 넣기 + 주행 모델 쪽 연결
-```bash
-cp -r projects tools tests patches <저장소 맨 위>/      # language 폴더, tools/language, tests/language, patches
-cd <저장소 맨 위>
-python patches/apply_language_patch.py --check   # 5군데 위치가 모두 찾아지는지만 확인
-python patches/apply_language_patch.py           # 수정 (원본은 motion_planning_head.py.bak 으로 백업)
-```
-원본 `motion_planning_head.py`는 Windows 줄바꿈(CRLF)이라 `git apply`가 잘 안 먹을 수 있어서, 줄바꿈을 그대로 유지하는 스크립트를 권장한다.
-스크립트는 (1) import 1줄 (2) 생성자 인자 2개 (3) 빌더 생성 4줄 (4) forward 끝부분 패킷 생성 블록 (5) planning_output 한 줄을 더한다.
-위치를 못 찾으면 그 파일이 서로 다르게 고쳐진 것이니 덮어쓰지 말고 같이 맞추자. 이미 적용된 파일이면 아무것도 하지 않는다.
+### 0) 주행 모델 쪽 연결 (A 담당)
+`motion_planning_head.py`에 패킷 hook을 넣는 변경은 A가 적용한다. 바뀌는 곳은 5군데:
+(1) import 1줄 (2) 생성자 인자 2개 (3) 빌더 생성 4줄 (4) forward 끝부분 패킷 생성 블록 (5) planning_output 한 줄.
+C의 파일(language/, tools/language, tests/language)은 이 연결 없이도 CPU 테스트가 돈다.
 
 config에 추가 (끄려면 이 줄을 빼면 됨):
 ```python
@@ -103,13 +99,13 @@ python tools/language/gen_reason_labels.py --pkl data/infos/nuscenes_infos_train
 
 ### 4) 학습 → 평가
 ```bash
-python tools/language/train_language.py --stage 1 --lm Qwen/Qwen2.5-1.5B-Instruct \
+python tools/language/train_language.py --stage 1 --lm Qwen/Qwen1.5-1.8B-Chat \
    --labels data/language/reasons_train.jsonl --packets data/language/packets_train \
    --val-labels data/language/reasons_val.jsonl --val-packets data/language/packets_val \
    --out work_dirs/language/stage1 --epochs 3 --batch-size 8 --lr 1e-3
-python tools/language/train_language.py --stage 2 --init work_dirs/language/stage1/best --lr 2e-4 \
+python tools/language/train_language.py --stage 2 --init work_dirs/language/stage1/best --load-8bit --lr 2e-4 \
    --labels ... --packets ... --val-labels ... --val-packets ... --out work_dirs/language/stage2
-python tools/language/eval_language.py --ckpt work_dirs/language/stage2/best --stage 2 \
+python tools/language/eval_language.py --ckpt work_dirs/language/stage2/best --stage 2 --load-8bit \
    --labels data/language/reasons_val.jsonl --packets data/language/packets_val --meta-source pred \
    --out work_dirs/language/stage2/eval_pred.jsonl
 ```
@@ -136,16 +132,18 @@ CPU 디버그: 위 명령에 `--tiny --workers 0` 을 붙이면 다운로드 없
 ```python
 from projects.mmdet3d_plugin.models.language import build_language_module
 lm = build_language_module(cfg)            # cfg=None → 꺼짐(기본값)
-meta_idx, reason = lm.infer(scene_input)   # meta_idx: 0~11 int (문서 번호 체계, meta_spec.py) / 파싱 실패 시 (None, None)
+meta_idx, reason = lm.infer(scene_input)   # meta_idx: 0~11 int (문서 번호 체계, meta_spec.py) / 파싱 실패 시 scene_input의 규칙 메타행동으로 대체, 그것도 없으면 (None, None)
 ```
 - A·B용 mock: `dict(type="mock", mode="fixed"|"cycle"|"echo", fail_every=N, delay_s=...)`
-- 실제 모델: `dict(type="hf", ckpt_dir=..., lm_path="Qwen/Qwen2.5-1.5B-Instruct", load_in_4bit=True)`
+- 실제 모델: `dict(type="hf", ckpt_dir=..., lm_path="Qwen/Qwen1.5-1.8B-Chat", load_in_8bit=True)`
   현재는 임베딩 경로(scene/scene_mask/scene_type/traj, 배치 차원 없이)만 지원. 텍스트 요약 경로는 회의 결정 후 추가.
 - 번호 체계: 라벨·패킷은 meta_action.py 순서(우/좌/직), LM 입출력은 문서 순서(좌/직/우). 변환은 `from_rls_index`/`to_rls_index` 한 곳에서만 한다.
 
 학습·평가 플래그:
 - `--predict-action`: LM이 `Meta-action: ...\nReason: ...`을 직접 쓰도록 학습 (hf 모듈은 이렇게 학습한 체크포인트만 받음). train과 eval에 둘 다 붙인다.
-- `--qlora`: stage 2에서 4bit(nf4) 기반 LoRA. CUDA와 bitsandbytes가 필요하고, CPU에서는 검증하지 않았다.
+- `--load-8bit`: 팀 설정(Qwen1.5-1.8B-Chat 8bit + LoRA). train과 eval에 둘 다 붙인다. CUDA와 bitsandbytes가 필요하고, 실제 로드는 GPU에서 아직 검증하지 않았다(설정 전달만 CPU 테스트).
+- `--qlora`: 대안으로 4bit(nf4) 기반 LoRA. 위와 같이 GPU 미검증.
+- 라벨 모델: 기본 `Qwen/Qwen2.5-VL-3B-Instruct`, 7B로 정하면 `gen_reason_labels.py --model Qwen/Qwen2.5-VL-7B-Instruct`.
 - `gen_reason_labels.py --mock`: VLM과 이미지 없이 라벨 파이프라인을 CPU에서 확인.
 
 ## 8. 환경 (2026-10-08 결정: 원본 문서 환경, RTX 3090)
