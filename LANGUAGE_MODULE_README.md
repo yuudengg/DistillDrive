@@ -42,7 +42,7 @@ projects/mmdet3d_plugin/models/language/        (새 폴더)
   projector.py      SceneProjector: 장면 토큰 + 궤적 토큰 → LM 임베딩
   language_head.py  LanguageHead: 입력 조립, loss(근거 토큰만), generate, save/load, LoRA
   dataset.py        ReasonPacketDataset, collate_fn
-  meta_spec.py      메타행동 번호 체계 (문서 순서 좌/직/우) + meta_action.py 순서와의 변환
+  meta_spec.py      메타행동 번호 체계 (팀 확정 순서 우/좌/직, meta_action.py와 동일)
   output_parser.py  LM 출력 형식(`Meta-action: ...` 다음 줄 `Reason: ...`)과 파서
   language_module.py  C 인터페이스: build_language_module, infer, Mock/HF 모듈 (7장)
   tiny.py           CPU 디버그용 작은 랜덤 Qwen2 + 토크나이저 (다운로드 없음)
@@ -137,7 +137,7 @@ meta_idx, reason = lm.infer(scene_input)   # meta_idx: 0~11 int (문서 번호 �
 - A·B용 mock: `dict(type="mock", mode="fixed"|"cycle"|"echo", fail_every=N, delay_s=...)`
 - 실제 모델: `dict(type="hf", ckpt_dir=..., lm_path="Qwen/Qwen1.5-1.8B-Chat", load_in_8bit=True)`
   현재는 임베딩 경로(scene/scene_mask/scene_type/traj, 배치 차원 없이)만 지원. 텍스트 요약 경로는 회의 결정 후 추가.
-- 번호 체계: 라벨·패킷은 meta_action.py 순서(우/좌/직), LM 입출력은 문서 순서(좌/직/우). 변환은 `from_rls_index`/`to_rls_index` 한 곳에서만 한다.
+- 번호 체계: 팀 확정 순서 우(0)/좌(1)/직(2) (A 인터페이스 스펙 v2). 라벨·패킷·LM 입출력·`infer()` 반환값 모두 같은 번호를 쓴다. `from_rls_index`/`to_rls_index`는 예전 호출부 호환용으로 남겨 둔 항등 함수다.
 
 학습·평가 플래그:
 - `--predict-action`: LM이 `Meta-action: ...\nReason: ...`을 직접 쓰도록 학습 (hf 모듈은 이렇게 학습한 체크포인트만 받음). train과 eval에 둘 다 붙인다.

@@ -1,19 +1,18 @@
 """Meta-action numbering = the ONE place to change if the team changes the convention.
 
-Convention (언어 모듈 역할 분담 문서 4장 인터페이스):
+Convention (팀 확정 2026-10-13, A 인터페이스 스펙 v2 = 데이터셋·앵커·체크포인트·meta_action.py 기준):
     meta_idx = lateral * 4 + longitudinal          (0 ~ 11)
-    lateral      : 0 left(좌) / 1 straight(직) / 2 right(우)
+    lateral      : 0 right(우) / 1 left(좌) / 2 straight(직)
     longitudinal : 0 accelerate(가속) / 1 keep(유지) / 2 decelerate(감속) / 3 stop(정지)
 
-Canonical text name = "<lateral>+<longitudinal>", e.g. 6 -> "straight+decelerate".
-The label files written by C and the LM output both use this name.
+Canonical text name = "<lateral>+<longitudinal>", e.g. 6 -> "left+decelerate".
+The label files written by C and the LM output both use this name (not the number).
 
-NOTE: the teammate file models/motion/meta_action.py currently uses a DIFFERENT lateral order
-(0 right / 1 left / 2 straight). Use from_rls_index() to convert its output until the team settles on one.
+from_rls_index / to_rls_index are kept for old callers; with the unified order they are identity.
 """
 from typing import Tuple
 
-LATERAL = ("left", "straight", "right")
+LATERAL = ("right", "left", "straight")  # same order as models/motion/meta_action.py
 LONGITUDINAL = ("accelerate", "keep", "decelerate", "stop")
 NUM_LATERAL = len(LATERAL)
 NUM_LONGITUDINAL = len(LONGITUDINAL)
@@ -24,7 +23,7 @@ LONGITUDINAL_KO = {"accelerate": "가속", "keep": "유지", "decelerate": "감�
 
 
 def meta_index(lateral: str, longitudinal: str) -> int:
-    """('straight', 'decelerate') -> 6"""
+    """('left', 'decelerate') -> 6"""
     return LATERAL.index(lateral) * NUM_LONGITUDINAL + LONGITUDINAL.index(longitudinal)
 
 
@@ -37,25 +36,25 @@ def split_meta(meta_idx: int) -> Tuple[int, int]:
 
 
 def meta_name(meta_idx: int) -> str:
-    """6 -> 'straight+decelerate'"""
+    """6 -> 'left+decelerate'"""
     lat, lon = split_meta(meta_idx)
     return f"{LATERAL[lat]}+{LONGITUDINAL[lon]}"
 
 
 def meta_name_ko(meta_idx: int) -> str:
-    """6 -> '직진+감속'"""
+    """6 -> '좌회전+감속'"""
     lat, lon = split_meta(meta_idx)
     return f"{LATERAL_KO[LATERAL[lat]]}+{LONGITUDINAL_KO[LONGITUDINAL[lon]]}"
 
 
 # ----------------------------------------------------------------------------------
-# conversion from the teammate's meta_action.py numbering (lateral 0 right / 1 left / 2 straight)
+# meta_action.py numbering (identical now that the order is unified; kept so old callers still work)
 # ----------------------------------------------------------------------------------
 _RLS_TO_DOC_LATERAL = {0: LATERAL.index("right"), 1: LATERAL.index("left"), 2: LATERAL.index("straight")}
 
 
 def from_rls_index(meta_idx_rls: int) -> int:
-    """meta_action.py index -> this convention. e.g. rls 6 (left+decelerate) -> 2 (left+decelerate here)."""
+    """meta_action.py index -> this convention (identity since the 2026-10-13 order decision)."""
     meta_idx_rls = int(meta_idx_rls)
     if not 0 <= meta_idx_rls < NUM_META:
         raise ValueError(f"meta_idx must be in [0, {NUM_META}), got {meta_idx_rls}")

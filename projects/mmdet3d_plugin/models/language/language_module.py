@@ -185,12 +185,12 @@ LanguageModule = HFLanguageModule  # name used in the role documents
 # ----------------------------------------------------------------------------------
 # factory (config-driven, so A only writes a dict in the config)
 # ----------------------------------------------------------------------------------
-_REGISTRY = {"mock": MockLanguageModule, "hf": HFLanguageModule}
+_REGISTRY = {"mock": MockLanguageModule, "hf": HFLanguageModule, "LanguageModule": HFLanguageModule}  # A config: type="LanguageModule"
 
 
 def build_language_module(cfg: Optional[Dict]) -> Optional[LanguageModuleBase]:
     """cfg=None -> None (language module off, the default).
-    cfg=dict(type="mock", mode="cycle") / dict(type="hf", ckpt_dir=..., lm_path=...)
+    cfg=dict(type="mock", mode="cycle") / dict(type="hf" or "LanguageModule", ckpt_dir=..., lm_path=...)
     """
     if cfg is None:
         return None

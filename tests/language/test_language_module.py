@@ -21,25 +21,27 @@ lm_mod = import_module(lang.__name__ + ".language_module")
 
 
 # ---------------------------------------------------------------------------- meta_spec
-def test_numbering_follows_the_doc():
-    # doc: lateral 0 left / 1 straight / 2 right, longitudinal 0 acc / 1 keep / 2 dec / 3 stop, idx = lat*4 + lon
-    assert spec.LATERAL == ("left", "straight", "right")
+def test_numbering_follows_the_team_order():
+    # team (A spec v2): lateral 0 right / 1 left / 2 straight, longitudinal 0 acc / 1 keep / 2 dec / 3 stop, idx = lat*4 + lon
+    assert spec.LATERAL == ("right", "left", "straight")
     assert spec.LONGITUDINAL == ("accelerate", "keep", "decelerate", "stop")
-    assert spec.meta_index("left", "accelerate") == 0
-    assert spec.meta_index("straight", "keep") == 5
-    assert spec.meta_index("right", "stop") == 11
+    assert spec.meta_index("right", "accelerate") == 0
+    assert spec.meta_index("left", "decelerate") == 6
+    assert spec.meta_index("straight", "keep") == 9
+    assert spec.meta_index("straight", "stop") == 11
     names = [spec.meta_name(i) for i in range(12)]
     assert len(set(names)) == 12
     for i in range(12):
         lat, lon = spec.split_meta(i)
         assert spec.meta_index(spec.LATERAL[lat], spec.LONGITUDINAL[lon]) == i
-    assert spec.meta_name_ko(6) == "직진+감속"
+    assert spec.meta_name_ko(6) == "좌회전+감속"
     with pytest.raises(ValueError):
         spec.split_meta(12)
 
 
-def test_conversion_from_teammate_numbering():
-    # meta_action.py: lateral 0 right / 1 left / 2 straight
+def test_rls_conversion_is_identity():
+    # meta_action.py uses the same order now, the helpers stay for old callers
+    assert all(spec.from_rls_index(i) == i for i in range(12))
     assert spec.from_rls_index(6) == spec.meta_index("left", "decelerate")  # rls 6 = left + decelerate
     assert spec.from_rls_index(0) == spec.meta_index("right", "accelerate")
     assert spec.from_rls_index(9) == spec.meta_index("straight", "keep")
@@ -62,21 +64,21 @@ def test_format_then_parse_roundtrip(idx):
 @pytest.mark.parametrize(
     "text, expected",
     [
-        ("meta-action: STRAIGHT+DECELERATE\nreason: ped ahead.", 6),
-        ("Meta-action: decelerate+straight\nReason: ped ahead.", 6),  # reversed order
-        ("Meta-action: turn left while slowing down\nReason: junction.", 2),  # phrase
-        ("Meta action: go straight and speed up\nReason: road clear.", 4),
-        ("메타행동: 좌회전+감속\n근거: 교차로에서 보행자가 있다.", 2),  # Korean
-        ("행동: 우+정지\n이유: 신호가 빨간불이다.", 11),  # Korean short form
-        ("```\nMeta-action: right+keep\nReason: lane change.\n```", 9),  # code fence
-        ('"Meta-action: left+stop\nReason: red light."', 3),  # quotes
-        ("Sure! Meta-action: straight+keep\nReason: clear road. Hope this helps.", 5),  # chatter before
+        ("meta-action: STRAIGHT+DECELERATE\nreason: ped ahead.", ("straight", "decelerate")),
+        ("Meta-action: decelerate+straight\nReason: ped ahead.", ("straight", "decelerate")),  # reversed order
+        ("Meta-action: turn left while slowing down\nReason: junction.", ("left", "decelerate")),  # phrase
+        ("Meta action: go straight and speed up\nReason: road clear.", ("straight", "accelerate")),
+        ("메타행동: 좌회전+감속\n근거: 교차로에서 보행자가 있다.", ("left", "decelerate")),  # Korean
+        ("행동: 우+정지\n이유: 신호가 빨간불이다.", ("right", "stop")),  # Korean short form
+        ("```\nMeta-action: right+keep\nReason: lane change.\n```", ("right", "keep")),  # code fence
+        ('"Meta-action: left+stop\nReason: red light."', ("left", "stop")),  # quotes
+        ("Sure! Meta-action: straight+keep\nReason: clear road. Hope this helps.", ("straight", "keep")),  # chatter before
     ],
 )
 def test_parser_tolerates_real_world_outputs(text, expected):
     res = parser.parse_output(text)
     assert res.ok, res.error
-    assert res.meta_idx == expected
+    assert res.meta_idx == spec.meta_index(*expected)
 
 
 def test_parser_reports_failures_without_raising():
@@ -86,13 +88,13 @@ def test_parser_reports_failures_without_raising():
     amb = parser.parse_output("Meta-action: left or right, slow down\nReason: unsure.")
     assert not amb.ok and "ambiguous" in amb.error
     no_reason = parser.parse_output("Meta-action: straight+keep")
-    assert no_reason.meta_idx == 5 and no_reason.reason is None and not no_reason.ok
+    assert no_reason.meta_idx == spec.meta_index("straight", "keep") and no_reason.reason is None and not no_reason.ok
     assert "reason" in no_reason.error
 
 
 def test_reason_without_header_and_multiline_reason():
     res = parser.parse_output("Meta-action: right+decelerate\nThe car ahead is braking.")
-    assert res.ok and res.meta_idx == 10 and res.reason == "The car ahead is braking."
+    assert res.ok and res.meta_idx == spec.meta_index("right", "decelerate") and res.reason == "The car ahead is braking."
     res = parser.parse_output("Meta-action: left+keep\nReason: The road curves\n   to the left.")
     assert res.reason == "The road curves to the left."
 
@@ -111,7 +113,7 @@ def test_lenient_mode_fills_one_missing_axis():
 def test_korean_single_syllables_need_to_stand_alone():
     # '우' inside '우산' (umbrella) must not count as 'right'
     res = parser.parse_output("행동: 직진+유지\n근거: 우산을 쓴 보행자가 인도에 있다.")
-    assert res.ok and res.meta_idx == 5
+    assert res.ok and res.meta_idx == spec.meta_index("straight", "keep")
 
 
 # ---------------------------------------------------------------------------- mock module + factory
@@ -139,13 +141,14 @@ def test_mock_failures_and_raw_output():
     out = [m.infer({}) for _ in range(6)]
     assert out[2] == (None, None) and out[5] == (None, None) and out[0][0] is not None
     raw = lm_mod.MockLanguageModule(raw_output="Meta-action: right+stop\nReason: red light ahead.")
-    assert raw.infer({}) == (11, "red light ahead.")
+    assert raw.infer({}) == (spec.meta_index("right", "stop"), "red light ahead.")
     broken = lm_mod.MockLanguageModule(raw_output="I am not sure.")
     assert broken.infer({}) == (None, None)
 
 
 def test_infer_batch_and_factory():
     assert lm_mod.build_language_module(None) is None  # default off
+    assert lm_mod._REGISTRY["LanguageModule"] is lm_mod.HFLanguageModule  # name used in A's language_config.py
     m = lm_mod.build_language_module(dict(type="mock", mode="cycle"))
     assert isinstance(m, lm_mod.MockLanguageModule)
     res = m.infer_batch([{}, {}, {}])

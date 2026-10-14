@@ -98,7 +98,7 @@ def test_parse_failure_falls_back_to_rule_meta():
              traj=torch.zeros(T, 2))
     res = module.infer_batch([dict(x, meta_action=6), dict(x, meta_action=6)])
     assert res[0] == (lang.from_rls_index(6), None) and module.num_fallback == 1  # rule, meta_action.py numbering
-    assert res[1] == (11, "red light.")
+    assert res[1] == (lang.meta_index("right", "stop"), "red light.")
     head.generate = lambda batch, **kw: ["garbage"]
     assert module.infer(x) == (None, None)  # no rule meta-action in the input -> caller decides
 
