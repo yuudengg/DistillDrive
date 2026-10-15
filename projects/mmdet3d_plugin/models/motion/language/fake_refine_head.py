@@ -33,23 +33,23 @@ class FakeRefineHead(nn.Module):
         self.reg_head = nn.Linear(embed_dims, fut_ts * out_dim)
         self.cls_head = nn.Linear(embed_dims, 1)
 
-    def layer_forward(self, i, feat, cond=None):
+    def layer_forward(self, i, feat, cond=None, modulate=None):
         """한 '층'을 실행. cond(=adaLN 조건)가 있으면 norm 자리에 adaLN-Zero 주입.
 
-        cond = (gamma, beta, alpha)
+        feat: [B, N, D] (실제 plan query처럼 경로 N개)
+        cond = (gamma, beta, alpha), 각 [B, 1, D]
           gamma: scale, beta: shift, alpha: gate(0이면 항등 → 원본 그대로)
+        modulate: B의 AdaLNZero.modulate (식은 B 파일 한 곳에만 둔다)
         """
         h = self.act(self.layers[i](feat))
         if cond is not None:
-            gamma, beta, alpha = cond
-            h_mod = h * (1 + gamma) + beta          # scale & shift
-            h = h + alpha * (h_mod - h)             # gate: alpha=0이면 h 그대로
+            h = modulate(h, *cond)                  # h + alpha * ((1 + gamma) * LN(h) + beta)
         return h
 
     def head(self, feat):
-        bs = feat.shape[0]
-        reg = self.reg_head(feat).reshape(bs, self.fut_ts, self.out_dim)
-        cls = self.cls_head(feat).squeeze(-1)       # [B] 불확실성/신뢰 신호
+        bs, n = feat.shape[:2]
+        reg = self.reg_head(feat).reshape(bs, n, self.fut_ts, self.out_dim)  # [B, N, T, 2]
+        cls = self.cls_head(feat).squeeze(-1)       # [B, N] 불확실성/신뢰 신호
         return reg, cls
 
     def run_whole(self, feat):

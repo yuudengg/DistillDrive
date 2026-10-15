@@ -29,6 +29,7 @@ from projects.mmdet3d_plugin.models.diffusion import DistributionModule, Predict
 from ..attention import gen_sineembed_for_position
 from ..blocks import linear_relu_ln
 from ..instance_bank import topk
+from ..language import build_language_module
 
 
 @HEADS.register_module()
@@ -122,9 +123,13 @@ class MotionPlanningHead(BaseModule):
         self.use_feedback = lang_cfg.get("enabled", False)
         self.split = lang_cfg.get("split", None)
         self.trigger_threshold = lang_cfg.get("trigger_threshold", 0.5)
-        self.adaln = build(lang_cfg.get("adaln", None), PLUGIN_LAYERS)            # B: forward(meta_idx)->(g,b,a)
-        self.language_model = build(lang_cfg.get("language_model", None), PLUGIN_LAYERS)  # C: infer(scene_input)->(meta_idx, sentence)
+        # 켜져 있을 때만 만든다 (off면 언어 모델(1.8B)도 안 불러옴)
+        self.adaln = None
+        self.language_model = None
         if self.use_feedback:
+            self.adaln = build(lang_cfg.get("adaln", None), PLUGIN_LAYERS)  # B: forward(meta_idx)->(g,b,a)
+            # C: infer_batch([scene_input])->[(meta_idx, sentence)], C의 factory로 생성 (type: mock / hf / LanguageModule)
+            self.language_model = build_language_module(lang_cfg.get("language_model", None))
             assert (self.adaln is not None and self.language_model is not None), (
                 "language_module.enabled=True 인데 adaln/language_model 설정이 없습니다"
             )
@@ -493,29 +498,33 @@ class MotionPlanningHead(BaseModule):
                     cond=None,
                 )
                 # === STEP 2: feedback 2nd pass (A 통합) ===
-                # 1차 plan_cls가 불확실할 때만, 메타행동(말)으로 조건을 만들어 refine만 재실행
-                if self.use_feedback and self._trigger(plan_cls):
-                    meta_idx, _sentence = self.language_model.infer(
-                        self._scene_input(instance_feature, metas)
-                    )
-                    cond = self.adaln(meta_idx)
-                    (
-                        motion_cls,
-                        motion_reg,
-                        plan_cls,
-                        plan_reg,
-                        plan_status,
-                        plan_query,
-                    ) = self._refine_once(
-                        i,
-                        instance_feature,
-                        anchor_embed,
-                        num_anchor,
-                        motion_mode_pos,
-                        plan_mode_pos,
-                        plan_anchor_delta,
-                        cond=cond,
-                    )
+                # 1차 plan_cls가 불확실한 샘플만, 메타행동(말)으로 조건을 만들어 refine만 재실행
+                if self.use_feedback:
+                    use = self._trigger(plan_cls)  # [B] 불확실한 샘플
+                    if use.any():
+                        meta_idx, use = self._query_language(instance_feature, metas, use)
+                    if use.any():
+                        cond = self.adaln(meta_idx)  # [B] -> (g, b, a) 각 [B, 1, D]
+                        first = (motion_cls, motion_reg, plan_cls, plan_reg, plan_status, plan_query)
+                        second = self._refine_once(
+                            i,
+                            instance_feature,
+                            anchor_embed,
+                            num_anchor,
+                            motion_mode_pos,
+                            plan_mode_pos,
+                            plan_anchor_delta,
+                            cond=cond,
+                        )
+                        # 트리거 + 언어 성공한 샘플만 2차 결과, 나머지는 1차 결과 그대로
+                        (
+                            motion_cls,
+                            motion_reg,
+                            plan_cls,
+                            plan_reg,
+                            plan_status,
+                            plan_query,
+                        ) = [self._select(use, s, f) for s, f in zip(second, first)]
                 motion_classification.append(motion_cls)
                 motion_prediction.append(motion_reg)
                 planning_classification.append(plan_cls)
@@ -549,15 +558,50 @@ class MotionPlanningHead(BaseModule):
         return motion_output, planning_output
 
     def _trigger(self, plan_cls):
-        """1차 계획이 불확실하면 True (신뢰도 최댓값 < 임계값). 불확실할 때만 언어 호출."""
+        """샘플마다 1차 계획이 불확실하면 True (신뢰도 최댓값 < 임계값). 불확실할 때만 언어 호출.
+        plan_cls [B, 1, ME] -> [B] bool"""
         with torch.no_grad():
-            conf = plan_cls.sigmoid()
-            return bool(conf.max().item() < self.trigger_threshold)
+            conf = plan_cls.sigmoid().flatten(1)
+            return conf.max(dim=1).values < self.trigger_threshold
 
-    def _scene_input(self, instance_feature, metas):
-        """언어모듈 입력. 팀 합의: 1차는 '텍스트 요약' 형식.
+    def _query_language(self, instance_feature, metas, use):
+        """트리거된 샘플만 언어 모델에 묻는다 (infer_batch).
+        Returns: meta_idx [B] long (미사용 샘플은 0), use [B] bool (언어 실패(None) 샘플은 False)"""
+        idx = use.nonzero().flatten().tolist()
+        results = self.language_model.infer_batch(
+            [self._scene_input(instance_feature, metas, b) for b in idx]
+        )
+        meta_idx = torch.zeros(use.shape[0], dtype=torch.long, device=use.device)
+        use = use.clone()
+        for b, (m, _sentence) in zip(idx, results):
+            if m is None:  # 언어 모델 실패 -> 이 샘플은 1차 결과 유지
+                use[b] = False
+            else:
+                meta_idx[b] = int(m)
+        return meta_idx, use
+
+    @staticmethod
+    def _select(use, new, old):
+        """use [B] 인 샘플은 new, 나머지는 old (배치 첫 축 기준)"""
+        if new is None or old is None:
+            return old
+        return torch.where(use.reshape([-1] + [1] * (old.dim() - 1)), new, old)
+
+    def _scene_input(self, instance_feature, metas, b):
+        """언어모듈 입력 (샘플 b 하나). 팀 합의: 1차는 '텍스트 요약' 형식.
         TODO(C): scene_input 최종 형식(텍스트 요약) 확정 후 여기 맞추기."""
-        return {"instance_feature": instance_feature, "metas": metas}
+        bs = instance_feature.shape[0]
+
+        def pick(v):
+            if torch.is_tensor(v) and v.dim() > 0 and v.shape[0] == bs:
+                return v[b]
+            if isinstance(v, (list, tuple)) and len(v) == bs:
+                return v[b]
+            return v
+
+        if isinstance(metas, dict):
+            metas = {k: pick(v) for k, v in metas.items()}
+        return {"instance_feature": instance_feature[b], "metas": metas}
 
     def _refine_once(
         self,
@@ -585,8 +629,8 @@ class MotionPlanningHead(BaseModule):
             g = gamma.reshape(shape)
             b = beta.reshape(shape)
             a = alpha.reshape(shape)
-            plan_mod = plan_query * (1 + g) + b
-            plan_query = plan_query + a * (plan_mod - plan_query)
+            # 식은 B의 AdaLNZero.modulate 한 곳에: q + a * ((1 + g) * LN(q) + b)
+            plan_query = self.adaln.modulate(plan_query, g, b, a)
         # Only get one Status, Must to commperss in MultiModal
         ego_feature = self.ego_feature_avp(instance_feature[:, num_anchor:].permute(0, 2, 1)).permute(0, 2, 1) # [B, 1, D]
         ego_anchor_embed = self.ego_pos_avp(anchor_embed[:, num_anchor:].permute(0, 2, 1)).permute(0, 2, 1)  # [B, 1, D]
