@@ -14,6 +14,9 @@
   LM also predicts the meta-action (needed by LanguageModule.infer):  add  --predict-action  (train AND eval)
 
   CPU smoke test (no downloads, tiny random LM):  add  --tiny  (needs packets/labels in the same format)
+
+  text route (scene as a sentence from the info pkl, no packets needed; LoRA only -> --stage 2):
+    python tools/language/train_language.py --stage 2 --predict-action         --labels data/language/reasons_train.jsonl --pkl data/infos/nuscenes_infos_train.pkl         --val-labels data/language/reasons_val.jsonl --val-pkl data/infos/nuscenes_infos_val.pkl         --out work_dirs/language/text --epochs 3 --batch-size 8 --lr 2e-4
 """
 import argparse
 import json
@@ -33,7 +36,7 @@ from _compat import load_language_package  # noqa: E402
 def build_head(args, lang, corpus_for_tiny=None):
     lora_cfg = dict(r=args.lora_r, lora_alpha=2 * args.lora_r) if args.stage == 2 else None
     common = dict(scene_dim=args.scene_dim, traj_steps=args.traj_steps, lang=args.lang, lora_cfg=lora_cfg,
-                  predict_action=args.predict_action)
+                  predict_action=args.predict_action, input_mode="text" if args.pkl else "embed")
     if args.tiny:
         from importlib import import_module
 
@@ -64,9 +67,11 @@ def main():
     ap.add_argument("--lm", default="Qwen/Qwen1.5-1.8B-Chat")
     ap.add_argument("--tiny", action="store_true")
     ap.add_argument("--labels", required=True)
-    ap.add_argument("--packets", required=True)
+    ap.add_argument("--packets", default=None, help="packet dir (embedding route)")
+    ap.add_argument("--pkl", default=None, help="nuScenes info pkl (text route, instead of --packets)")
     ap.add_argument("--val-labels", default=None)
     ap.add_argument("--val-packets", default=None)
+    ap.add_argument("--val-pkl", default=None)
     ap.add_argument("--out", required=True)
     ap.add_argument("--init", default=None, help="checkpoint dir (projector.pt [+ lora.pt]) to start from")
     ap.add_argument("--meta-source", choices=["gt", "pred"], default="gt")
@@ -92,6 +97,10 @@ def main():
     ap.add_argument("--log-every", type=int, default=20)
     ap.add_argument("--max-samples", type=int, default=None)
     args = ap.parse_args()
+    if bool(args.packets) == bool(args.pkl):
+        ap.error("give exactly one of --packets (embedding route) or --pkl (text route)")
+    if args.pkl and args.stage != 2:
+        ap.error("the text route has no projector: train LoRA with --stage 2")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -101,20 +110,21 @@ def main():
     ds_mod = import_module(lang.__name__ + ".dataset")
     device = torch.device("cuda" if torch.cuda.is_available() and not args.tiny else "cpu")
 
-    train_ds = lang.ReasonPacketDataset(
-        args.labels, args.packets, meta_source=args.meta_source, with_objects=args.with_objects, lang=args.lang,
-        max_samples=args.max_samples,
-    )
+    def make_ds(labels, packets, pkl):
+        if pkl:
+            return lang.ReasonTextDataset(labels, pkl, max_samples=args.max_samples)
+        return lang.ReasonPacketDataset(labels, packets, meta_source=args.meta_source, with_objects=args.with_objects,
+                                        lang=args.lang, max_samples=args.max_samples)
+
+    train_ds = make_ds(args.labels, args.packets, args.pkl)
     print("[data] train", train_ds.stats)
     val_ds = None
     if args.val_labels:
-        val_ds = lang.ReasonPacketDataset(
-            args.val_labels, args.val_packets, meta_source=args.meta_source, with_objects=args.with_objects,
-            lang=args.lang, max_samples=args.max_samples,
-        )
+        val_ds = make_ds(args.val_labels, args.val_packets, args.val_pkl)
         print("[data] val  ", val_ds.stats)
 
-    head = build_head(args, lang, corpus_for_tiny=[r["reason"] for r in train_ds.rows] + ["Planned meta-action: Driving scene tokens:"])
+    corpus = [r["reason"] for r in train_ds.rows] + list(getattr(train_ds, "texts", {}).values())
+    head = build_head(args, lang, corpus_for_tiny=corpus + ["Planned meta-action: Driving scene tokens:"])
     if args.init:
         head.load(args.init)
     if args.grad_ckpt:
@@ -122,7 +132,7 @@ def main():
         head.lm.enable_input_require_grads()
     if not (args.qlora or args.load_8bit):  # quantized weights are already placed on the GPU and cannot be moved
         head.to(device)
-    else:
+    elif head.projector is not None:
         head.projector.to(device)
     head.train()
     params = head.trainable_parameters()

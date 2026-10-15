@@ -136,7 +136,17 @@ meta_idx, reason = lm.infer(scene_input)   # meta_idx: 0~11 int (문서 번호 �
 ```
 - A·B용 mock: `dict(type="mock", mode="fixed"|"cycle"|"echo", fail_every=N, delay_s=...)`
 - 실제 모델: `dict(type="hf", ckpt_dir=..., lm_path="Qwen/Qwen1.5-1.8B-Chat", load_in_8bit=True)`
-  현재는 임베딩 경로(scene/scene_mask/scene_type/traj, 배치 차원 없이)만 지원. 텍스트 요약 경로는 회의 결정 후 추가.
+  `scene_input`은 두 경로 모두 같은 패킷 dict(`split_packet` 결과)다. 체크포인트가 어느 경로로 학습됐는지(`language_head.json`의 `input_mode`)에 따라 C 안에서 처리가 갈린다.
+  - 임베딩 경로(`input_mode="embed"`): `scene`/`scene_mask`/`scene_type`/`traj`를 투영기로 LM에 넣는다.
+  - 텍스트 경로(`input_mode="text"`, 2026-10-15 팀 결정: 텍스트로 먼저 돌려 보고 임베딩으로 전환): `scene_input["text"]`가 있으면 그대로 쓰고, 없으면 `traj`/`agent_xy`/`agent_labels`/`agent_conf`로 문장을 만든다(`prompt.scene_text_from_packet`). 투영기 없이 LoRA만 학습한다.
+  - 텍스트 경로 학습은 패킷 없이 info pkl(GT 박스 + GT 미래 궤적)로 문장을 만든다. `--packets` 대신 `--pkl`, 단계는 `--stage 2`만 가능:
+    ```bash
+    python tools/language/train_language.py --stage 2 --predict-action \
+       --labels data/language/reasons_train.jsonl --pkl data/infos/nuscenes_infos_train.pkl \
+       --val-labels data/language/reasons_val.jsonl --val-pkl data/infos/nuscenes_infos_val.pkl \
+       --out work_dirs/language/text --epochs 3 --batch-size 8 --lr 2e-4
+    ```
+    학습 문장은 GT에서, 추론 문장은 주행 모델 예측에서 나오지만 형식은 같은 함수(`prompt.describe_scene`)로 만든다.
 - 번호 체계: 팀 확정 순서 우(0)/좌(1)/직(2) (A 인터페이스 스펙 v2). 라벨·패킷·LM 입출력·`infer()` 반환값 모두 같은 번호를 쓴다. `from_rls_index`/`to_rls_index`는 예전 호출부 호환용으로 남겨 둔 항등 함수다.
 
 학습·평가 플래그:

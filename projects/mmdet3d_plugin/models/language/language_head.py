@@ -7,6 +7,7 @@ Training stages (LLaVA style):
     stage 1: LM frozen, only SceneProjector is trained       (lora_cfg=None)
     stage 2: SceneProjector + LoRA on the LM                  (lora_cfg=dict(r=16, ...))
 The driving model is never touched: the packet is detached and cached on disk.
+Text route (input_mode="text"): [ "Driving scene:" | scene sentence (prompt.describe_scene) | suffix ] -> LoRA only.
 """
 import json
 import os
@@ -18,7 +19,7 @@ import torch.nn as nn
 from .projector import SceneProjector
 from .meta_spec import from_rls_index
 from .output_parser import format_target
-from .prompt import PROMPT_PREFIX, build_prompt_suffix, build_target
+from .prompt import PROMPT_PREFIX, TEXT_PREFIX, build_prompt_suffix, build_target
 
 DEFAULT_LORA = dict(
     r=16,
@@ -56,8 +57,10 @@ class LanguageHead(nn.Module):
         max_reason_tokens: int = 64,
         traj_scale: float = 0.1,
         predict_action: bool = False,
+        input_mode: str = "embed",
     ):
         super().__init__()
+        assert input_mode in ("embed", "text"), input_mode
         for p in lm.parameters():  # freeze first, LoRA adds its own trainable weights afterwards
             p.requires_grad_(False)
         self.lm = apply_lora(lm, lora_cfg)
@@ -68,12 +71,16 @@ class LanguageHead(nn.Module):
         self.max_reason_tokens = max_reason_tokens
         # True: the LM also writes the meta-action (output_parser.format_target), used by HFLanguageModule.infer
         self.predict_action = predict_action
+        # "text": the scene arrives as a sentence (batch["text"]) and only LoRA is trained -> no projector
+        self.input_mode = input_mode
         lm_dim = self.lm.get_input_embeddings().weight.shape[1]
-        self.projector = SceneProjector(scene_dim, lm_dim, projector_hidden, traj_steps=traj_steps, traj_scale=traj_scale)
+        self.projector = None
+        if input_mode == "embed":
+            self.projector = SceneProjector(scene_dim, lm_dim, projector_hidden, traj_steps=traj_steps, traj_scale=traj_scale)
         self.config = dict(
             scene_dim=scene_dim, traj_steps=traj_steps, projector_hidden=projector_hidden, lang=lang,
             lora_cfg=lora_cfg, max_reason_tokens=max_reason_tokens, traj_scale=traj_scale,
-            predict_action=predict_action,
+            predict_action=predict_action, input_mode=input_mode,
         )
 
     # ------------------------------------------------------------------ construction
@@ -108,7 +115,7 @@ class LanguageHead(nn.Module):
     # ------------------------------------------------------------------ helpers
     @property
     def device(self):
-        return next(self.projector.parameters()).device
+        return self.lm.get_input_embeddings().weight.device
 
     def _ids(self, text: str) -> List[int]:
         return self.tokenizer(text, add_special_tokens=False)["input_ids"]
@@ -121,11 +128,14 @@ class LanguageHead(nn.Module):
         """Assemble inputs_embeds / attention_mask / labels for one batch (see module docstring for the layout)."""
         dev = self.device
         lm_dtype = self.lm.get_input_embeddings().weight.dtype
-        scene_emb, scene_mask = self.projector(
-            batch["scene"].to(dev), batch["scene_type"].to(dev), batch["traj"].to(dev), batch["scene_mask"].to(dev)
-        )
-        bs = scene_emb.shape[0]
-        prefix_ids = self._ids(PROMPT_PREFIX)
+        if self.projector is not None:
+            scene_emb, scene_mask = self.projector(
+                batch["scene"].to(dev), batch["scene_type"].to(dev), batch["traj"].to(dev), batch["scene_mask"].to(dev)
+            )
+            bs = scene_emb.shape[0]
+        else:
+            bs = len(batch["text"])
+        prefix_ids = self._ids(PROMPT_PREFIX if self.projector is not None else TEXT_PREFIX)
         prefix_emb = self._embed(prefix_ids)
         objects = batch.get("objects") or [None] * bs
         eos = self.tokenizer.eos_token_id
@@ -134,13 +144,15 @@ class LanguageHead(nn.Module):
         for i in range(bs):
             meta = int(batch["meta_action"][i]) if "meta_action" in batch else None
             suffix_ids = self._ids(build_prompt_suffix(None if self.predict_action else meta, objects[i], self.lang))
-            parts = [prefix_emb, scene_emb[i].to(lm_dtype), self._embed(suffix_ids)]
-            attn = [
-                torch.ones(len(prefix_ids), dtype=torch.long, device=dev),
-                scene_mask[i].long(),
-                torch.ones(len(suffix_ids), dtype=torch.long, device=dev),
-            ]
-            lab = [torch.full((len(prefix_ids) + scene_emb.shape[1] + len(suffix_ids),), -100, dtype=torch.long, device=dev)]
+            if self.projector is not None:
+                mid, mid_mask = scene_emb[i].to(lm_dtype), scene_mask[i].long()
+            else:
+                text_ids = self._ids(" " + batch["text"][i])
+                mid, mid_mask = self._embed(text_ids), torch.ones(len(text_ids), dtype=torch.long, device=dev)
+            parts = [prefix_emb, mid, self._embed(suffix_ids)]
+            attn = [torch.ones(len(prefix_ids), dtype=torch.long, device=dev), mid_mask,
+                    torch.ones(len(suffix_ids), dtype=torch.long, device=dev)]
+            lab = [torch.full((len(prefix_ids) + mid.shape[0] + len(suffix_ids),), -100, dtype=torch.long, device=dev)]
             if with_target:
                 if self.predict_action:  # labels / packets use meta_action.py numbering, the LM writes the doc numbering
                     text = format_target(from_rls_index(meta), batch["reason"][i])
@@ -198,7 +210,8 @@ class LanguageHead(nn.Module):
 
     def save(self, out_dir: str):
         os.makedirs(out_dir, exist_ok=True)
-        torch.save(self.projector.state_dict(), os.path.join(out_dir, "projector.pt"))
+        if self.projector is not None:
+            torch.save(self.projector.state_dict(), os.path.join(out_dir, "projector.pt"))
         lora = self._lora_state()
         if lora:
             torch.save(lora, os.path.join(out_dir, "lora.pt"))
@@ -206,7 +219,8 @@ class LanguageHead(nn.Module):
             json.dump(self.config, f, indent=2)
 
     def load(self, ckpt_dir: str, strict: bool = True):
-        self.projector.load_state_dict(torch.load(os.path.join(ckpt_dir, "projector.pt"), map_location="cpu"), strict=strict)
+        if self.projector is not None:
+            self.projector.load_state_dict(torch.load(os.path.join(ckpt_dir, "projector.pt"), map_location="cpu"), strict=strict)
         lora_path = os.path.join(ckpt_dir, "lora.pt")
         if os.path.exists(lora_path):
             missing = self.lm.load_state_dict(torch.load(lora_path, map_location="cpu"), strict=False)

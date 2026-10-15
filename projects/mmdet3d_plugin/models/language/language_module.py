@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .meta_spec import NUM_META, from_rls_index, meta_index, meta_name
 from .output_parser import ParseResult, parse_output
+from .prompt import scene_text_from_packet
 
 InferResult = Tuple[Optional[int], Optional[str]]
 
@@ -108,8 +109,9 @@ class HFLanguageModule(LanguageModuleBase):
     Flow:  scene_input -> LanguageHead (projector + LM, prompt does NOT reveal the meta-action) -> generate -> parse_output
     Train the head with  train_language.py --predict-action  (target = output_parser.format_target(meta, reason)).
 
-    Only the embedding route (scene / scene_mask / scene_type / traj) is implemented.
-    TODO if the team picks the text route: build the prompt from scene_input["text"] instead.
+    scene_input is the same per-sample packet dict for both routes (split_packet output), so A never changes:
+      embed checkpoint : scene / scene_mask / scene_type / traj are projected into the LM
+      text checkpoint  : scene_input["text"] if given, else built here from traj / agent_xy / agent_labels / agent_conf
     """
 
     def __init__(
@@ -156,8 +158,11 @@ class HFLanguageModule(LanguageModuleBase):
     def infer_batch(self, scene_inputs: Sequence[Dict]) -> List[InferResult]:
         import torch
 
-        batch = {k: torch.stack([torch.as_tensor(x[k]) for x in scene_inputs]) for k in ("scene", "scene_mask", "scene_type", "traj")}
-        batch["scene"], batch["traj"] = batch["scene"].float(), batch["traj"].float()
+        if self.head.input_mode == "text":
+            batch = {"text": [x["text"] if "text" in x else scene_text_from_packet(x) for x in scene_inputs]}
+        else:
+            batch = {k: torch.stack([torch.as_tensor(x[k]) for x in scene_inputs]) for k in ("scene", "scene_mask", "scene_type", "traj")}
+            batch["scene"], batch["traj"] = batch["scene"].float(), batch["traj"].float()
         texts = self.head.generate(batch, max_new_tokens=self.max_new_tokens)
         self.last_parse = [parse_output(t, lenient=self.lenient) for t in texts]
         out = []
