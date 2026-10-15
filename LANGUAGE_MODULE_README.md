@@ -53,18 +53,26 @@ tools/language/
   gen_reason_labels.py    Qwen2.5-VL(3B/7B)로 근거 라벨 생성                    ← GPU
   train_language.py       단계 1/2 학습                                          ← GPU (--tiny는 CPU)
   eval_language.py        생성 품질 + 1차 궤적 메타행동 정확도                    ← GPU
-tests/language/   CPU 테스트 3개 (pipeline, language_module, hf_language_module)
+tools/language/patches/  A의 motion_planning_head.py에 C를 연결하는 패치 (A가 적용)
+tests/language/   CPU 테스트 (pipeline, language_module, hf_language_module, text_route, a_integration)
 ```
-주행 모델 쪽 연결(`motion_planning_head.py`에 패킷 hook 추가)은 파일 소유권 규칙에 따라 A가 적용한다 (패치는 A에게 따로 전달).
+주행 모델 쪽 연결(`motion_planning_head.py`)은 파일 소유권 규칙에 따라 A가 `tools/language/patches/`로 적용한다.
 
 ## 4. 적용 순서
 
 필요 패키지: `torch`(패킷 덤프는 1.x에서도 동작, 언어모델 학습은 2.x 기준으로 확인), `transformers`(Qwen2.5-VL은 4.49 이상), `peft`(단계 2 LoRA), `accelerate`(device_map 사용 시), 라벨 생성에는 `pillow`.
 
 ### 0) 주행 모델 쪽 연결 (A 담당)
-`motion_planning_head.py`에 패킷 hook을 넣는 변경은 A가 적용한다. 바뀌는 곳은 5군데:
-(1) import 1줄 (2) 생성자 인자 2개 (3) 빌더 생성 4줄 (4) forward 끝부분 패킷 생성 블록 (5) planning_output 한 줄.
+A의 되먹임 통합(`a8930b8`) 위에 C를 연결하는 패치. 저장소 맨 위에서:
+```bash
+python tools/language/patches/apply_language_patch.py --check   # 위치만 확인
+python tools/language/patches/apply_language_patch.py           # 적용 (.bak 백업)
+```
+바뀌는 곳: (1) import (패킷 빌더, `split_packet`, 되먹임 도우미; 이 import로 `LanguageModule`이 `PLUGIN_LAYERS`에 등록됨)
+(2) 생성자 인자 `lang_packet_cfg`, `lang_packet_refine_idx` (3) 빌더 생성 (4) 되먹임 호출을 샘플별 `infer_batch`로, 실패한 샘플은 1차 결과 유지
+(5) A의 TODO(C) `_scene_input`: 1차 refine 결과로 패킷을 만들어 샘플별 dict 리스트 반환 (6) forward 끝 패킷(덤프용, eval만).
 C의 파일(language/, tools/language, tests/language)은 이 연결 없이도 CPU 테스트가 돈다.
+A의 config에서 언어모듈은 `language_model=dict(type="LanguageModule", ckpt_dir=..., lm_path=...)` 또는 `dict(type="MockLanguageModule", mode="cycle", fail_every=4)`.
 
 config에 추가 (끄려면 이 줄을 빼면 됨):
 ```python

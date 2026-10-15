@@ -1,4 +1,4 @@
-from .packet import LangPacketBuilder, attach_packet_dumper, load_packet, save_packets
+from .packet import LangPacketBuilder, attach_packet_dumper, load_packet, save_packets, split_packet
 from .prompt import (
     NUM_META_ACTIONS,
     action_consistency,
@@ -18,13 +18,22 @@ from .language_head import LanguageHead
 from .dataset import ReasonPacketDataset, ReasonTextDataset, collate_fn
 from .meta_spec import NUM_META, meta_index, meta_name, meta_name_ko, split_meta, from_rls_index, to_rls_index
 from .output_parser import ParseResult, format_target, parse_output
-from .language_module import LanguageModuleBase, LanguageModule, MockLanguageModule, HFLanguageModule, build_language_module
+from .language_module import (
+    LanguageModuleBase,
+    LanguageModule,
+    MockLanguageModule,
+    HFLanguageModule,
+    build_language_module,
+    feedback_meta,
+    select_per_sample,
+)
 
 __all__ = [
     "LangPacketBuilder",
     "attach_packet_dumper",
     "load_packet",
     "save_packets",
+    "split_packet",
     "SceneProjector",
     "LanguageHead",
     "ReasonPacketDataset",
@@ -57,4 +66,6 @@ __all__ = [
     "MockLanguageModule",
     "HFLanguageModule",
     "build_language_module",
+    "feedback_meta",
+    "select_per_sample",
 ]

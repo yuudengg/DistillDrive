@@ -11,15 +11,15 @@ Contract for callers (A's trigger code):
   * infer() never raises on bad LM output -> the caller decides the fallback (e.g. keep the 1st-pass trajectory)
   * no gradient flows out of this module
 
-scene_input (NOT FINAL - the team still decides 'text summary vs query embedding'):
-  a dict; keys a module may read:
-    "scene"      : [L, D] float   scene tokens (ego / agents / map) from the dump
-    "scene_mask" : [L] bool
-    "scene_type" : [L] long       0 ego, 1 agent, 2 map
-    "traj"       : [T, 2] float   1st-pass trajectory (positions)
-    "text"       : str            text summary of the scene (if the text route is chosen)
-    "meta_idx"   : int            rule-based meta-action from B (optional, used by MockLanguageModule 'echo')
-  Unknown keys are ignored, so A and B can already pass whatever they have.
+scene_input = one sample of a LangPacketBuilder packet (packet.split_packet), the same for both routes:
+    "traj"       : [T, 2] float   1st-pass trajectory (positions)               text + embed route
+    "agent_xy" / "agent_labels" / "agent_conf"   detected agents               text route
+    "scene" / "scene_mask" / "scene_type"        projected scene tokens        embed route
+    "meta_action": rule meta-action (fallback when the LM output cannot be parsed)
+    "text"       : str            optional: overrides the sentence built from the packet (text route)
+  Unknown keys are ignored. Team decision 2026-10-15: text route first, embedding later (checkpoint decides).
+
+Building from an mmdet config (A): type="LanguageModule" / "MockLanguageModule" are registered in PLUGIN_LAYERS.
 """
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -204,3 +204,33 @@ def build_language_module(cfg: Optional[Dict]) -> Optional[LanguageModuleBase]:
     if kind not in _REGISTRY:
         raise KeyError(f"unknown language module type '{kind}', choose from {sorted(_REGISTRY)}")
     return _REGISTRY[kind](**cfg)
+
+
+try:  # A builds the module with build_from_cfg(cfg, PLUGIN_LAYERS); the CPU test env has no mmcv
+    from mmcv.cnn.bricks.registry import PLUGIN_LAYERS
+
+    PLUGIN_LAYERS.register_module(name="LanguageModule", module=HFLanguageModule)
+    PLUGIN_LAYERS.register_module(name="MockLanguageModule", module=MockLanguageModule)
+except Exception:  # pragma: no cover
+    pass
+
+
+# ----------------------------------------------------------------------------------
+# helpers for A's per-sample feedback (adaLN PDF #3/#4): infer_batch -> [B] meta, per-sample fallback
+# ----------------------------------------------------------------------------------
+def feedback_meta(results: Sequence[InferResult], device=None):
+    """infer_batch results -> (ok [B] bool, meta [B] long). Failed samples get meta 0 and must keep the 1st pass."""
+    import torch
+
+    ok = torch.tensor([m is not None for m, _ in results], dtype=torch.bool, device=device)
+    meta = torch.tensor([m if m is not None else 0 for m, _ in results], dtype=torch.long, device=device)
+    return ok, meta
+
+
+def select_per_sample(ok, first, second):
+    """second[b] where ok[b] else first[b], for [B, ...] tensors or tuples / lists of them (e.g. _refine_once outputs)."""
+    import torch
+
+    if isinstance(first, (tuple, list)):
+        return type(first)(select_per_sample(ok, f, s) for f, s in zip(first, second))
+    return torch.where(ok.reshape([-1] + [1] * (first.dim() - 1)), second, first)
