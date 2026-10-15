@@ -72,6 +72,7 @@ class MotionPlanningHead(BaseModule):
         kd_loss_de_feats=None,
         motion_decoder=None,
         planning_decoder=None,
+        language_module=None,
         num_det=50,
         num_map=10,
     ):
@@ -114,6 +115,19 @@ class MotionPlanningHead(BaseModule):
             ]
         )
         self.embed_dims = embed_dims
+
+        # =========== language feedback (A 통합) ===========
+        # 철칙: enabled=False(기본)면 출력은 원본과 100% 동일(회귀).
+        lang_cfg = language_module or {}
+        self.use_feedback = lang_cfg.get("enabled", False)
+        self.split = lang_cfg.get("split", None)
+        self.trigger_threshold = lang_cfg.get("trigger_threshold", 0.5)
+        self.adaln = build(lang_cfg.get("adaln", None), PLUGIN_LAYERS)            # B: forward(meta_idx)->(g,b,a)
+        self.language_model = build(lang_cfg.get("language_model", None), PLUGIN_LAYERS)  # C: infer(scene_input)->(meta_idx, sentence)
+        if self.use_feedback:
+            assert (self.adaln is not None and self.language_model is not None), (
+                "language_module.enabled=True 인데 adaln/language_model 설정이 없습니다"
+            )
 
         if self.decouple_attn:
             self.fc_before = nn.Linear(
@@ -478,10 +492,30 @@ class MotionPlanningHead(BaseModule):
                     plan_anchor_delta,
                     cond=None,
                 )
-                # TODO(STEP 2): feedback 2nd pass, refine only (no gnn / VAE re-run)
-                # if self.use_feedback:
-                #     cond = self.adaln(...)  # meta-action -> condition
-                #     (...) = self._refine_once(..., cond=cond)
+                # === STEP 2: feedback 2nd pass (A 통합) ===
+                # 1차 plan_cls가 불확실할 때만, 메타행동(말)으로 조건을 만들어 refine만 재실행
+                if self.use_feedback and self._trigger(plan_cls):
+                    meta_idx, _sentence = self.language_model.infer(
+                        self._scene_input(instance_feature, metas)
+                    )
+                    cond = self.adaln(meta_idx)
+                    (
+                        motion_cls,
+                        motion_reg,
+                        plan_cls,
+                        plan_reg,
+                        plan_status,
+                        plan_query,
+                    ) = self._refine_once(
+                        i,
+                        instance_feature,
+                        anchor_embed,
+                        num_anchor,
+                        motion_mode_pos,
+                        plan_mode_pos,
+                        plan_anchor_delta,
+                        cond=cond,
+                    )
                 motion_classification.append(motion_cls)
                 motion_prediction.append(motion_reg)
                 planning_classification.append(plan_cls)
@@ -514,6 +548,17 @@ class MotionPlanningHead(BaseModule):
 
         return motion_output, planning_output
 
+    def _trigger(self, plan_cls):
+        """1차 계획이 불확실하면 True (신뢰도 최댓값 < 임계값). 불확실할 때만 언어 호출."""
+        with torch.no_grad():
+            conf = plan_cls.sigmoid()
+            return bool(conf.max().item() < self.trigger_threshold)
+
+    def _scene_input(self, instance_feature, metas):
+        """언어모듈 입력. 팀 합의: 1차는 '텍스트 요약' 형식.
+        TODO(C): scene_input 최종 형식(텍스트 요약) 확정 후 여기 맞추기."""
+        return {"instance_feature": instance_feature, "metas": metas}
+
     def _refine_once(
         self,
         i,
@@ -533,6 +578,15 @@ class MotionPlanningHead(BaseModule):
         # get motion and planing feature
         motion_query = motion_mode_pos + (instance_feature + anchor_embed)[:, :num_anchor].unsqueeze(2) # [B, N1, MA, D]
         plan_query = plan_mode_pos + (instance_feature + anchor_embed)[:, num_anchor:].unsqueeze(1) # [B, 1, ME, D]
+        # === adaLN 조건 주입 (A 통합, cond=None이면 아무 영향 없음) ===
+        if cond is not None:
+            gamma, beta, alpha = cond
+            shape = [gamma.shape[0]] + [1] * (plan_query.dim() - 2) + [gamma.shape[-1]]
+            g = gamma.reshape(shape)
+            b = beta.reshape(shape)
+            a = alpha.reshape(shape)
+            plan_mod = plan_query * (1 + g) + b
+            plan_query = plan_query + a * (plan_mod - plan_query)
         # Only get one Status, Must to commperss in MultiModal
         ego_feature = self.ego_feature_avp(instance_feature[:, num_anchor:].permute(0, 2, 1)).permute(0, 2, 1) # [B, 1, D]
         ego_anchor_embed = self.ego_pos_avp(anchor_embed[:, num_anchor:].permute(0, 2, 1)).permute(0, 2, 1)  # [B, 1, D]
