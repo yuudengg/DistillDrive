@@ -70,15 +70,16 @@ python tools/language/patches/apply_language_patch.py           # 적용 (.bak �
 ```
 바뀌는 곳: (1) import (패킷 빌더, `split_packet`, 되먹임 도우미; 이 import로 `LanguageModule`이 `PLUGIN_LAYERS`에 등록됨)
 (2) 생성자 인자 `lang_packet_cfg`, `lang_packet_refine_idx` (3) 빌더 생성 (4) 되먹임 호출을 샘플별 `infer_batch`로, 실패한 샘플은 1차 결과 유지
-(5) A의 TODO(C) `_scene_input`: 1차 refine 결과로 패킷을 만들어 샘플별 dict 리스트 반환 (6) forward 끝 패킷(덤프용, eval만).
+(5) A의 TODO(C) `_scene_input`: 1차 refine 결과로 패킷을 만들어 샘플별 dict 리스트 반환 (트리거가 걸릴 때만 계산)
+(6) forward 끝 패킷: `lang_packet_dump=True`일 때만 (기본 꺼짐, `attach_packet_dumper`가 자동으로 켬). 평소엔 매 프레임 추가 계산 없음.
 C의 파일(language/, tools/language, tests/language)은 이 연결 없이도 CPU 테스트가 돈다.
-A의 config에서 언어모듈은 `language_model=dict(type="LanguageModule", ckpt_dir=..., lm_path=...)` 또는 `dict(type="MockLanguageModule", mode="cycle", fail_every=4)`.
+A의 config에서 언어모듈은 `language_model=dict(type="LanguageModule", ckpt_dir=..., lm_path=..., device="cuda")` 또는 `dict(type="MockLanguageModule", mode="cycle", fail_every=4)`.
 
 config에 추가 (끄려면 이 줄을 빼면 됨):
 ```python
 lang_packet_cfg=dict(type="LangPacketBuilder", num_agents=12, num_map=6, ego_fut_ts=6, ego_fut_mode=6,
                      meta_action=dict(dt=0.5, lat_thresh=2.0)),
-lang_packet_refine_idx=-1,   # 되먹임 연결 후에는 2 (= refine 3 직후)
+lang_packet_refine_idx=-1,   # 덤프 패킷에 쓸 refine 출력 (-1 = 마지막)
 ```
 
 ### 1) CPU: 테스트 + GT 메타행동 + 임계값 분포 (언어팀 노트북)
@@ -143,7 +144,7 @@ lm = build_language_module(cfg)            # cfg=None → 꺼짐(기본값)
 meta_idx, reason = lm.infer(scene_input)   # meta_idx: 0~11 int (문서 번호 체계, meta_spec.py) / 파싱 실패 시 scene_input의 규칙 메타행동으로 대체, 그것도 없으면 (None, None)
 ```
 - A·B용 mock: `dict(type="mock", mode="fixed"|"cycle"|"echo", fail_every=N, delay_s=...)`
-- 실제 모델: `dict(type="hf", ckpt_dir=..., lm_path="Qwen/Qwen1.5-1.8B-Chat", load_in_8bit=True)`
+- 실제 모델: `dict(type="hf", ckpt_dir=..., lm_path="Qwen/Qwen1.5-1.8B-Chat", device="cuda")` (메모리가 부족하면 `load_in_8bit=True`; 8bit는 자동으로 GPU). `device`를 빼면 GPU가 있을 때 GPU를 쓴다.
   `scene_input`은 두 경로 모두 같은 패킷 dict(`split_packet` 결과)다. 체크포인트가 어느 경로로 학습됐는지(`language_head.json`의 `input_mode`)에 따라 C 안에서 처리가 갈린다.
   - 임베딩 경로(`input_mode="embed"`): `scene`/`scene_mask`/`scene_type`/`traj`를 투영기로 LM에 넣는다.
   - 텍스트 경로(`input_mode="text"`, 2026-10-15 팀 결정: 텍스트로 먼저 돌려 보고 임베딩으로 전환): `scene_input["text"]`가 있으면 그대로 쓰고, 없으면 `traj`/`agent_xy`/`agent_labels`/`agent_conf`로 문장을 만든다(`prompt.scene_text_from_packet`). 투영기 없이 LoRA만 학습한다.

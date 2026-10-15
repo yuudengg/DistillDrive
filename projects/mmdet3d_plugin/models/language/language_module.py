@@ -123,13 +123,16 @@ class HFLanguageModule(LanguageModuleBase):
         max_new_tokens: int = 64,
         load_in_4bit: bool = False,
         load_in_8bit: bool = False,
-        device: Optional[str] = None,
+        device: Optional[str] = None,  # None: GPU if available for a head loaded here (an injected head stays put)
     ):
-        if head is None:
+        loaded_here = head is None
+        if loaded_here:
             head = self._load_head(ckpt_dir, lm_path, load_in_4bit, load_in_8bit)
         assert head.predict_action, "this checkpoint was trained without --predict-action: it cannot output a meta-action"
-        if device is not None and not (load_in_4bit or load_in_8bit):  # quantized weights are already on the GPU
-            head.to(device)
+        if not (load_in_4bit or load_in_8bit) and (device is not None or loaded_here):  # quantized is already on the GPU
+            import torch
+
+            head.to(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.head = head.eval()
         self.lenient, self.max_new_tokens = lenient, max_new_tokens
         self.last_parse: List[ParseResult] = []

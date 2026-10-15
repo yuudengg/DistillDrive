@@ -64,3 +64,27 @@ def test_packet_to_infer_batch_with_failures():
     results = lm.infer_batch([lang.split_packet(pkt, b) for b in range(bs)])
     ok, meta = lang.feedback_meta(results)
     assert ok.tolist() == [True, False, True][:bs] and meta.shape == (bs,)
+
+
+def test_hf_module_loaded_from_config_goes_to_gpu(monkeypatch):
+    """A builds the module from config without device=... -> it must not silently stay on the CPU."""
+    from test_language_pipeline import REASONS, tiny
+
+    lm_mod = sys.modules[lang.__name__ + ".language_module"]
+
+    def tiny_head():
+        lm, tok = tiny.build_tiny_lm_and_tokenizer(REASONS)
+        head = lang.LanguageHead(lm, tok, predict_action=True, input_mode="text")
+        moved = []
+        head.to = lambda dev: moved.append(dev) or head
+        return head, moved
+
+    head, moved = tiny_head()
+    monkeypatch.setattr(lm_mod.HFLanguageModule, "_load_head", staticmethod(lambda *a, **k: head))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    lang.LanguageModule(ckpt_dir="x", lm_path="y")  # what build_from_cfg does with A's config
+    assert moved == ["cuda"]
+    head2, moved2 = tiny_head()
+    lang.LanguageModule(ckpt_dir="x", lm_path="y", load_in_8bit=True)  # quantized: already placed, never moved
+    lang.LanguageModule(head=head2)  # injected head (tests / notebooks): left where it is
+    assert moved == ["cuda"] and moved2 == []

@@ -1,5 +1,5 @@
 diff --git a/projects/mmdet3d_plugin/models/motion/motion_planning_head.py b/projects/mmdet3d_plugin/models/motion/motion_planning_head.py
-index 263516e..4422cd7 100755
+index 263516e..31b6b81 100755
 --- a/projects/mmdet3d_plugin/models/motion/motion_planning_head.py
 +++ b/projects/mmdet3d_plugin/models/motion/motion_planning_head.py
 @@ -29,6 +29,8 @@ from projects.mmdet3d_plugin.models.diffusion import DistributionModule, Predict
@@ -11,29 +11,32 @@ index 263516e..4422cd7 100755
  
  
  @HEADS.register_module()
-@@ -75,6 +77,8 @@ class MotionPlanningHead(BaseModule):
+@@ -75,6 +77,9 @@ class MotionPlanningHead(BaseModule):
          language_module=None,
          num_det=50,
          num_map=10,
 +        lang_packet_cfg=None,
 +        lang_packet_refine_idx=-1,
++        lang_packet_dump=False,
      ):
  
          super(MotionPlanningHead, self).__init__()
-@@ -128,6 +132,12 @@ class MotionPlanningHead(BaseModule):
+@@ -128,6 +133,14 @@ class MotionPlanningHead(BaseModule):
              assert (self.adaln is not None and self.language_model is not None), (
                  "language_module.enabled=True 인데 adaln/language_model 설정이 없습니다"
              )
-+        # language packet (C): scene_input for the feedback call + optional dump. None = off.
-+        # lang_packet_refine_idx: which refine output the end-of-forward packet uses (-1 = last)
++        # language packet (C): scene_input for the feedback call, built only when the trigger fires. None = off.
++        # lang_packet_dump: also put a packet in planning_output (eval, for dumps; attach_packet_dumper sets it)
++        # lang_packet_refine_idx: which refine output that dump packet uses (-1 = last)
 +        self.lang_packet_builder = build(lang_packet_cfg, PLUGIN_LAYERS)
 +        self.lang_packet_refine_idx = lang_packet_refine_idx
++        self.lang_packet_dump = lang_packet_dump
 +        if self.use_feedback:
 +            assert self.lang_packet_builder is not None, "language feedback needs lang_packet_cfg (scene_input comes from the packet)"
  
          if self.decouple_attn:
              self.fc_before = nn.Linear(
-@@ -495,18 +505,17 @@ class MotionPlanningHead(BaseModule):
+@@ -495,18 +508,17 @@ class MotionPlanningHead(BaseModule):
                  # === STEP 2: feedback 2nd pass (A 통합) ===
                  # 1차 plan_cls가 불확실할 때만, 메타행동(말)으로 조건을 만들어 refine만 재실행
                  if self.use_feedback and self._trigger(plan_cls):
@@ -62,7 +65,7 @@ index 263516e..4422cd7 100755
                          i,
                          instance_feature,
                          anchor_embed,
-@@ -516,6 +525,14 @@ class MotionPlanningHead(BaseModule):
+@@ -516,6 +528,14 @@ class MotionPlanningHead(BaseModule):
                          plan_anchor_delta,
                          cond=cond,
                      )
@@ -77,13 +80,13 @@ index 263516e..4422cd7 100755
                  motion_classification.append(motion_cls)
                  motion_prediction.append(motion_reg)
                  planning_classification.append(plan_cls)
-@@ -523,6 +540,22 @@ class MotionPlanningHead(BaseModule):
+@@ -523,6 +543,22 @@ class MotionPlanningHead(BaseModule):
                  planning_status.append(plan_status)
                  planning_feature.append(plan_query)
  
-+        # =========== language packet (eval only, detached, does not change any driving output) ===========
++        # =========== language packet for dumps (eval only, detached, does not change any driving output) ===========
 +        lang_packet = None
-+        if self.lang_packet_builder is not None and not self.training:
++        if self.lang_packet_dump and self.lang_packet_builder is not None and not self.training:
 +            ref = self.lang_packet_refine_idx
 +            lang_packet = self.lang_packet_builder(
 +                agent_feat=instance_feature[:, :num_anchor],
@@ -100,7 +103,7 @@ index 263516e..4422cd7 100755
          self.instance_queue.cache_motion(instance_feature[:, :num_anchor], det_output, metas)
          self.instance_queue.cache_planning(instance_feature[:, num_anchor:], plan_status)
  
-@@ -542,6 +575,8 @@ class MotionPlanningHead(BaseModule):
+@@ -542,6 +578,8 @@ class MotionPlanningHead(BaseModule):
              "period": self.instance_queue.ego_period,
              "anchor_queue": self.instance_queue.ego_anchor_queue,
          }
@@ -109,7 +112,7 @@ index 263516e..4422cd7 100755
          # Add distribution to calculate the gradient
          if self.vae_model is True:
              planning_output["distribution"] = output_distribution
-@@ -554,10 +589,22 @@ class MotionPlanningHead(BaseModule):
+@@ -554,10 +592,22 @@ class MotionPlanningHead(BaseModule):
              conf = plan_cls.sigmoid()
              return bool(conf.max().item() < self.trigger_threshold)
  

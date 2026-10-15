@@ -6,11 +6,12 @@ Target: A's feedback integration (language branch a8930b8). Run from the reposit
 
 What changes (motion_planning_head.py is A's file, so A applies this):
   1. import LangPacketBuilder / split_packet / feedback helpers (the import also registers LanguageModule in PLUGIN_LAYERS)
-  2. constructor: lang_packet_cfg, lang_packet_refine_idx
+  2. constructor: lang_packet_cfg, lang_packet_refine_idx, lang_packet_dump
   3. build the packet builder (required when language_module.enabled=True)
   4. feedback call: per-sample infer_batch -> [B] meta -> adaln -> 2nd refine; failed samples keep the 1st pass
-  5. _scene_input: packet from the 1st-pass refine outputs, one dict per sample (A's TODO(C))
-  6. end of forward: optional detached packet in planning_output["lang_packet"] (eval only, for dumps)
+  5. _scene_input: packet from the 1st-pass refine outputs, one dict per sample (A's TODO(C)), only when triggered
+  6. end of forward: packet in planning_output["lang_packet"] only while dumping (lang_packet_dump, off by default;
+     attach_packet_dumper turns it on) -> no extra cost per frame otherwise
 
 Why a script as well as the .patch: the file uses Windows line endings (CRLF), which makes `git apply` fragile when the
 patch file is copied around. This script keeps the file's line ending and refuses to run if an anchor is missing.
@@ -30,17 +31,20 @@ EDITS = [
     ),
     (
         "        num_det=50,\n        num_map=10,\n    ):\n",
-        "        num_det=50,\n        num_map=10,\n        lang_packet_cfg=None,\n        lang_packet_refine_idx=-1,\n    ):\n",
+        "        num_det=50,\n        num_map=10,\n        lang_packet_cfg=None,\n        lang_packet_refine_idx=-1,\n"
+        "        lang_packet_dump=False,\n    ):\n",
     ),
     (
         "                \"language_module.enabled=True 인데 adaln/language_model 설정이 없습니다\"\n"
         "            )\n",
         "                \"language_module.enabled=True 인데 adaln/language_model 설정이 없습니다\"\n"
         "            )\n"
-        "        # language packet (C): scene_input for the feedback call + optional dump. None = off.\n"
-        "        # lang_packet_refine_idx: which refine output the end-of-forward packet uses (-1 = last)\n"
+        "        # language packet (C): scene_input for the feedback call, built only when the trigger fires. None = off.\n"
+        "        # lang_packet_dump: also put a packet in planning_output (eval, for dumps; attach_packet_dumper sets it)\n"
+        "        # lang_packet_refine_idx: which refine output that dump packet uses (-1 = last)\n"
         "        self.lang_packet_builder = build(lang_packet_cfg, PLUGIN_LAYERS)\n"
         "        self.lang_packet_refine_idx = lang_packet_refine_idx\n"
+        "        self.lang_packet_dump = lang_packet_dump\n"
         "        if self.use_feedback:\n"
         "            assert self.lang_packet_builder is not None, \"language feedback needs lang_packet_cfg (scene_input comes from the packet)\"\n",
     ),
@@ -111,9 +115,9 @@ EDITS = [
     ),
     (
         "        self.instance_queue.cache_motion(instance_feature[:, :num_anchor], det_output, metas)\n",
-        "        # =========== language packet (eval only, detached, does not change any driving output) ===========\n"
+        "        # =========== language packet for dumps (eval only, detached, does not change any driving output) ===========\n"
         "        lang_packet = None\n"
-        "        if self.lang_packet_builder is not None and not self.training:\n"
+        "        if self.lang_packet_dump and self.lang_packet_builder is not None and not self.training:\n"
         "            ref = self.lang_packet_refine_idx\n"
         "            lang_packet = self.lang_packet_builder(\n"
         "                agent_feat=instance_feature[:, :num_anchor],\n"
