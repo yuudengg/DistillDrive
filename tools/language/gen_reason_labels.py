@@ -11,6 +11,8 @@ Design points
   * the VLM sees the front camera image + the GT meta-action and writes ONE grounded sentence
   * resumable: rows already in --out are skipped; rejected outputs go to <out>.rejected.jsonl
   * --stride N takes every N-th sample, handy for a quick first pass before spending GPU hours on all of train
+  * --max-per-class N keeps at most N samples per meta-action (evenly spread over the scenes); rarer classes keep all.
+    nuScenes train is ~86% straight (43% keep+straight) and turns are ~14%, so this keeps every turn and thins straight
 
 CPU check of the whole pipeline (pkl -> prompt -> clean/validate -> jsonl) without a VLM:  add  --mock
 (images are not opened, the "VLM" returns a template sentence for the meta-action)
@@ -21,10 +23,23 @@ import argparse
 import json
 import os
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _compat import load_language_package  # noqa: E402
+
+
+def cap_per_class(items, cap):
+    """Keep at most `cap` items per meta-action (item[2]), evenly spaced in the original order; order is preserved."""
+    by_meta = defaultdict(list)
+    for i, item in enumerate(items):
+        by_meta[item[2]].append(i)
+    keep = set()
+    for idx in by_meta.values():
+        n = min(cap, len(idx))
+        keep.update(idx[k * len(idx) // n] for k in range(n))
+    return [item for i, item in enumerate(items) if i in keep]
 
 
 def main():
@@ -41,6 +56,7 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--stride", type=int, default=1)
+    ap.add_argument("--max-per-class", type=int, default=0, help="at most N samples per meta-action (0 = no cap)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--min-pixels", type=int, default=256 * 28 * 28)
     ap.add_argument("--max-pixels", type=int, default=640 * 28 * 28)
@@ -66,6 +82,9 @@ def main():
         if args.data_root and not os.path.isabs(path):
             path = os.path.join(args.data_root, path)
         todo.append((tok, path, int(meta_gt[tok])))
+    if args.max_per_class:
+        todo = cap_per_class(todo, args.max_per_class)  # before the resume filter, so a rerun selects the same samples
+    print("[info] selected per meta-action:", dict(sorted(Counter(m for _, _, m in todo).items())))
     done = set()
     if os.path.exists(args.out):
         with open(args.out) as f:
