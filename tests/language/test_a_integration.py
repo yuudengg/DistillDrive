@@ -1,7 +1,8 @@
-"""CPU tests for what A's motion_planning_head uses from C (no mmcv needed):
-  * LanguageModule / MockLanguageModule are registered in PLUGIN_LAYERS (A builds them with build_from_cfg)
-  * feedback_meta / select_per_sample: per-sample fallback to the 1st pass when infer_batch returns None
-  * packet -> split_packet -> infer_batch works with A's per-sample call
+"""CPU tests for what motion_planning_head (A/B feedback, 877c1f6 + tools/language/patches) uses from C (no mmcv needed):
+  * LangPacketBuilder is registered in PLUGIN_LAYERS (the head builds it with build(lang_packet_cfg, PLUGIN_LAYERS))
+  * build_language_module with the config types B's code passes (mock / LanguageModule)
+  * packet -> _scene_input (split_packet, sample b) -> infer_batch, with failures returned as None
+  * a module loaded from config goes to the GPU without device=...
 
     pytest tests/language -q
 """
@@ -14,16 +15,13 @@ import torch
 from test_language_pipeline import ROOT, lang, make_builder, make_inputs
 
 
-def test_language_modules_registered_in_plugin_layers():
+def test_lang_packet_builder_registered_in_plugin_layers():
     code = textwrap.dedent(f"""
         import sys, types
         import torch.nn as nn
         seen = {{}}
         class Registry:
             def register_module(self, name=None, force=False, module=None):
-                if module is not None:
-                    seen[name or module.__name__] = module
-                    return module
                 def deco(cls):
                     seen[name or cls.__name__] = cls
                     return cls
@@ -35,39 +33,33 @@ def test_language_modules_registered_in_plugin_layers():
         sys.path.insert(0, r"{ROOT / 'tools' / 'language'}")
         from _compat import load_language_package
         lang = load_language_package(r"{ROOT}")
-        assert seen["LanguageModule"] is lang.HFLanguageModule, sorted(seen)
-        assert seen["MockLanguageModule"] is lang.MockLanguageModule, sorted(seen)
         assert seen["LangPacketBuilder"] is lang.LangPacketBuilder, sorted(seen)
-        m = seen["MockLanguageModule"](mode="cycle", fail_every=4)  # what build_from_cfg does with A's config
-        assert m.infer({{}})[0] == 0
         print("ok")
     """)
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert r.returncode == 0 and "ok" in r.stdout, r.stderr
 
 
-def test_feedback_meta_and_select_per_sample():
-    ok, meta = lang.feedback_meta([(5, "a"), (None, None), (2, None)])
-    assert ok.tolist() == [True, False, True] and meta.tolist() == [5, 0, 2]
-
-    first = (torch.zeros(3, 1, 18), torch.zeros(3, 1, 18, 6, 2))  # e.g. plan_cls, plan_reg
-    second = (torch.ones(3, 1, 18), torch.ones(3, 1, 18, 6, 2))
-    out = lang.select_per_sample(ok, first, second)
-    assert isinstance(out, tuple)
-    assert out[0][:, 0, 0].tolist() == [1, 0, 1] and out[1][:, 0, 0, 0, 0].tolist() == [1, 0, 1]
+def test_build_language_module_from_feedback_config():
+    assert lang.build_language_module(None) is None  # enabled=False path never builds it, None also means off
+    m = lang.build_language_module(dict(type="mock", mode="cycle", fail_every=4))
+    assert isinstance(m, lang.MockLanguageModule)
+    assert lang.language_module._REGISTRY["LanguageModule"] is lang.HFLanguageModule
 
 
-def test_packet_to_infer_batch_with_failures():
+def test_packet_to_query_language_with_failures():
+    """What _query_language does after the patch: one packet, then sample b of it for every triggered sample."""
     pkt = make_builder()(**make_inputs(seed=3))
-    bs = pkt["traj"].shape[0]
+    triggered = [0, 2]
     lm = lang.MockLanguageModule(mode="cycle", fail_every=2)
-    results = lm.infer_batch([lang.split_packet(pkt, b) for b in range(bs)])
-    ok, meta = lang.feedback_meta(results)
-    assert ok.tolist() == [True, False, True][:bs] and meta.shape == (bs,)
+    inputs = [lang.split_packet(pkt, b) for b in triggered]
+    assert all(x["traj"].dim() == 2 and "agent_xy" in x for x in inputs)  # no batch dim, packet keys
+    results = lm.infer_batch(inputs)
+    assert results[0][0] == 0 and results[1] == (None, None)  # the 2nd call fails -> B keeps that sample's 1st pass
 
 
 def test_hf_module_loaded_from_config_goes_to_gpu(monkeypatch):
-    """A builds the module from config without device=... -> it must not silently stay on the CPU."""
+    """build_language_module(dict(type="LanguageModule", ...)) without device=... must not silently stay on the CPU."""
     from test_language_pipeline import REASONS, tiny
 
     lm_mod = sys.modules[lang.__name__ + ".language_module"]
@@ -82,7 +74,7 @@ def test_hf_module_loaded_from_config_goes_to_gpu(monkeypatch):
     head, moved = tiny_head()
     monkeypatch.setattr(lm_mod.HFLanguageModule, "_load_head", staticmethod(lambda *a, **k: head))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    lang.LanguageModule(ckpt_dir="x", lm_path="y")  # what build_from_cfg does with A's config
+    lang.build_language_module(dict(type="LanguageModule", ckpt_dir="x", lm_path="y"))
     assert moved == ["cuda"]
     head2, moved2 = tiny_head()
     lang.LanguageModule(ckpt_dir="x", lm_path="y", load_in_8bit=True)  # quantized: already placed, never moved

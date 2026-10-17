@@ -1,15 +1,15 @@
-"""Connect C's language module to A's motion_planning_head.py (same change as language_packet_hook.patch).
+"""Connect C's language module to motion_planning_head.py (same change as language_packet_hook.patch).
 
-Target: A's feedback integration (language branch a8930b8). Run from the repository root:
+Target: language branch after B's feedback fix (877c1f6). Run from the repository root:
     python tools/language/patches/apply_language_patch.py --check   # only check that every anchor is found
     python tools/language/patches/apply_language_patch.py           # edit in place (a .bak copy is written first)
 
-What changes (motion_planning_head.py is A's file, so A applies this):
-  1. import LangPacketBuilder / split_packet / feedback helpers (the import also registers LanguageModule in PLUGIN_LAYERS)
+B's feedback flow (per-sample trigger, infer_batch, None -> 1st pass, _select) is kept as is. Only C's part changes:
+  1. import split_packet
   2. constructor: lang_packet_cfg, lang_packet_refine_idx, lang_packet_dump
   3. build the packet builder (required when language_module.enabled=True)
-  4. feedback call: per-sample infer_batch -> [B] meta -> adaln -> 2nd refine; failed samples keep the 1st pass
-  5. _scene_input: packet from the 1st-pass refine outputs, one dict per sample (A's TODO(C)), only when triggered
+  4. feedback call: build the packet from the 1st-pass refine outputs (only when a sample is triggered) and query with it
+  5. _scene_input = sample b of that packet (the TODO(C)); the text / embedding conversion happens inside C's module
   6. end of forward: packet in planning_output["lang_packet"] only while dumping (lang_packet_dump, off by default;
      attach_packet_dumper turns it on) -> no extra cost per frame otherwise
 
@@ -24,10 +24,9 @@ TARGET = Path("projects/mmdet3d_plugin/models/motion/motion_planning_head.py")
 
 EDITS = [
     (
-        "from ..instance_bank import topk\n",
-        "from ..instance_bank import topk\n"
-        "from ..language.packet import LangPacketBuilder, split_packet  # noqa: F401  (also registers LanguageModule in PLUGIN_LAYERS)\n"
-        "from ..language.language_module import feedback_meta, select_per_sample\n",
+        "from ..language import build_language_module\n",
+        "from ..language import build_language_module\n"
+        "from ..language.packet import split_packet\n",
     ),
     (
         "        num_det=50,\n        num_map=10,\n    ):\n",
@@ -39,9 +38,9 @@ EDITS = [
         "            )\n",
         "                \"language_module.enabled=True 인데 adaln/language_model 설정이 없습니다\"\n"
         "            )\n"
-        "        # language packet (C): scene_input for the feedback call, built only when the trigger fires. None = off.\n"
-        "        # lang_packet_dump: also put a packet in planning_output (eval, for dumps; attach_packet_dumper sets it)\n"
-        "        # lang_packet_refine_idx: which refine output that dump packet uses (-1 = last)\n"
+        "        # C: 언어모듈 입력(scene_input)을 만드는 패킷 빌더. 되먹임을 켜면 필수, 트리거가 걸린 때만 계산.\n"
+        "        # lang_packet_dump: forward 끝 패킷을 planning_output에 저장 (덤프용, attach_packet_dumper가 켬)\n"
+        "        # lang_packet_refine_idx: 그 덤프 패킷에 쓸 refine 출력 (-1 = 마지막)\n"
         "        self.lang_packet_builder = build(lang_packet_cfg, PLUGIN_LAYERS)\n"
         "        self.lang_packet_refine_idx = lang_packet_refine_idx\n"
         "        self.lang_packet_dump = lang_packet_dump\n"
@@ -49,58 +48,41 @@ EDITS = [
         "            assert self.lang_packet_builder is not None, \"language feedback needs lang_packet_cfg (scene_input comes from the packet)\"\n",
     ),
     (
-        "                if self.use_feedback and self._trigger(plan_cls):\n"
-        "                    meta_idx, _sentence = self.language_model.infer(\n"
-        "                        self._scene_input(instance_feature, metas)\n"
-        "                    )\n"
-        "                    cond = self.adaln(meta_idx)\n"
-        "                    (\n"
-        "                        motion_cls,\n"
-        "                        motion_reg,\n"
-        "                        plan_cls,\n"
-        "                        plan_reg,\n"
-        "                        plan_status,\n"
-        "                        plan_query,\n"
-        "                    ) = self._refine_once(\n",
-        "                if self.use_feedback and self._trigger(plan_cls):\n"
-        "                    # C: per-sample scene_input -> infer_batch; samples whose LM call failed keep the 1st pass\n"
-        "                    results = self.language_model.infer_batch(\n"
-        "                        self._scene_input(\n"
+        "                        meta_idx, use = self._query_language(instance_feature, metas, use)\n",
+        "                        packet = self._lang_packet(\n"
         "                            instance_feature, num_anchor, det_confidence, det_anchors, det_classification,\n"
         "                            map_instance_feature_selected, plan_query, plan_reg, plan_cls, metas,\n"
         "                        )\n"
-        "                    )\n"
-        "                    ok, meta_idx = feedback_meta(results, device=plan_cls.device)\n"
-        "                    cond = self.adaln(meta_idx)  # [B] meta-action -> (gamma, beta, alpha)\n"
-        "                    first = (motion_cls, motion_reg, plan_cls, plan_reg, plan_status, plan_query)\n"
-        "                    second = self._refine_once(\n",
+        "                        meta_idx, use = self._query_language(packet, use)\n",
     ),
     (
-        "                        cond=cond,\n"
-        "                    )\n"
-        "                motion_classification.append(motion_cls)\n",
-        "                        cond=cond,\n"
-        "                    )\n"
-        "                    (\n"
-        "                        motion_cls,\n"
-        "                        motion_reg,\n"
-        "                        plan_cls,\n"
-        "                        plan_reg,\n"
-        "                        plan_status,\n"
-        "                        plan_query,\n"
-        "                    ) = select_per_sample(ok, first, second)\n"
-        "                motion_classification.append(motion_cls)\n",
+        "    def _query_language(self, instance_feature, metas, use):\n",
+        "    def _query_language(self, packet, use):\n",
     ),
     (
-        "    def _scene_input(self, instance_feature, metas):\n"
-        "        \"\"\"언어모듈 입력. 팀 합의: 1차는 '텍스트 요약' 형식.\n"
+        "            [self._scene_input(instance_feature, metas, b) for b in idx]\n",
+        "            [self._scene_input(packet, b) for b in idx]\n",
+    ),
+    (
+        "    def _scene_input(self, instance_feature, metas, b):\n"
+        "        \"\"\"언어모듈 입력 (샘플 b 하나). 팀 합의: 1차는 '텍스트 요약' 형식.\n"
         "        TODO(C): scene_input 최종 형식(텍스트 요약) 확정 후 여기 맞추기.\"\"\"\n"
-        "        return {\"instance_feature\": instance_feature, \"metas\": metas}\n",
-        "    def _scene_input(self, instance_feature, num_anchor, det_confidence, det_anchors, det_classification,\n"
+        "        bs = instance_feature.shape[0]\n"
+        "\n"
+        "        def pick(v):\n"
+        "            if torch.is_tensor(v) and v.dim() > 0 and v.shape[0] == bs:\n"
+        "                return v[b]\n"
+        "            if isinstance(v, (list, tuple)) and len(v) == bs:\n"
+        "                return v[b]\n"
+        "            return v\n"
+        "\n"
+        "        if isinstance(metas, dict):\n"
+        "            metas = {k: pick(v) for k, v in metas.items()}\n"
+        "        return {\"instance_feature\": instance_feature[b], \"metas\": metas}\n",
+        "    def _lang_packet(self, instance_feature, num_anchor, det_confidence, det_anchors, det_classification,\n"
         "                     map_feat, plan_query, plan_reg, plan_cls, metas):\n"
-        "        \"\"\"언어모듈 입력 (C): 1차 refine 결과로 패킷을 만들어 샘플별 dict 리스트로 돌려준다.\n"
-        "        텍스트 경로든 임베딩 경로든 같은 dict이고, 문장 변환은 언어모듈 안에서 한다.\"\"\"\n"
-        "        packet = self.lang_packet_builder(\n"
+        "        \"\"\"C: 1차 refine 결과로 언어 패킷 (배치 전체, detach). 트리거가 걸린 때만 호출된다.\"\"\"\n"
+        "        return self.lang_packet_builder(\n"
         "            agent_feat=instance_feature[:, :num_anchor],\n"
         "            agent_conf=det_confidence,\n"
         "            agent_boxes=det_anchors,\n"
@@ -111,7 +93,11 @@ EDITS = [
         "            cmd=metas.get(\"gt_ego_fut_cmd\") if isinstance(metas, dict) else None,\n"
         "            map_feat=map_feat,\n"
         "        )\n"
-        "        return [split_packet(packet, b) for b in range(plan_reg.shape[0])]\n",
+        "\n"
+        "    @staticmethod\n"
+        "    def _scene_input(packet, b):\n"
+        "        \"\"\"언어모듈 입력 (샘플 b 하나) = 패킷의 b번째. 텍스트/임베딩 경로 모두 같은 dict이고 변환은 C 안에서 한다.\"\"\"\n"
+        "        return split_packet(packet, b)\n",
     ),
     (
         "        self.instance_queue.cache_motion(instance_feature[:, :num_anchor], det_output, metas)\n",
