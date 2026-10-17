@@ -62,18 +62,19 @@ tests/language/   CPU 테스트 (pipeline, language_module, hf_language_module, 
 
 필요 패키지: `torch`(패킷 덤프는 1.x에서도 동작, 언어모델 학습은 2.x 기준으로 확인), `transformers`(Qwen2.5-VL은 4.49 이상), `peft`(단계 2 LoRA), `accelerate`(device_map 사용 시), 라벨 생성에는 `pillow`.
 
-### 0) 주행 모델 쪽 연결 (A 담당)
-A의 되먹임 통합(`a8930b8`) 위에 C를 연결하는 패치. 저장소 맨 위에서:
+### 0) 주행 모델 쪽 연결 (motion_planning_head.py 소유자가 적용)
+B의 되먹임 수정(`877c1f6`) 위에 C를 연결하는 패치. 저장소 맨 위에서:
 ```bash
-python tools/language/patches/apply_language_patch.py --check   # 위치만 확인
+python tools/language/patches/apply_language_patch.py --check   # 위치 9군데 확인만
 python tools/language/patches/apply_language_patch.py           # 적용 (.bak 백업)
 ```
-바뀌는 곳: (1) import (패킷 빌더, `split_packet`, 되먹임 도우미; 이 import로 `LanguageModule`이 `PLUGIN_LAYERS`에 등록됨)
-(2) 생성자 인자 `lang_packet_cfg`, `lang_packet_refine_idx` (3) 빌더 생성 (4) 되먹임 호출을 샘플별 `infer_batch`로, 실패한 샘플은 1차 결과 유지
-(5) A의 TODO(C) `_scene_input`: 1차 refine 결과로 패킷을 만들어 샘플별 dict 리스트 반환 (트리거가 걸릴 때만 계산)
+B의 흐름(샘플별 트리거, `infer_batch`, None이면 1차 결과 유지, `_select`)은 그대로 두고 C 부분만 바꾼다.
+(1) import `split_packet` (2) 생성자 인자 `lang_packet_cfg`, `lang_packet_refine_idx`, `lang_packet_dump` (3) 패킷 빌더 생성 (되먹임을 켜면 필수)
+(4) 트리거된 샘플이 있을 때만 1차 refine 결과로 패킷을 한 번 만들어 `_query_language(packet, use)`에 넘김
+(5) TODO(C) `_scene_input(packet, b)` = 패킷의 b번째 샘플 (`split_packet`). 문장/임베딩 변환은 C 안에서 한다
 (6) forward 끝 패킷: `lang_packet_dump=True`일 때만 (기본 꺼짐, `attach_packet_dumper`가 자동으로 켬). 평소엔 매 프레임 추가 계산 없음.
 C의 파일(language/, tools/language, tests/language)은 이 연결 없이도 CPU 테스트가 돈다.
-A의 config에서 언어모듈은 `language_model=dict(type="LanguageModule", ckpt_dir=..., lm_path=..., device="cuda")` 또는 `dict(type="MockLanguageModule", mode="cycle", fail_every=4)`.
+config의 언어모듈 (B 코드가 `build_language_module`로 만듦): `language_model=dict(type="LanguageModule", ckpt_dir=..., lm_path=..., device="cuda")`, 테스트는 `dict(type="mock", mode="cycle", fail_every=4)`.
 
 config에 추가 (끄려면 이 줄을 빼면 됨):
 ```python

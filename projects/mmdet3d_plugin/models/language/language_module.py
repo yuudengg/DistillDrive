@@ -19,7 +19,7 @@ scene_input = one sample of a LangPacketBuilder packet (packet.split_packet), th
     "text"       : str            optional: overrides the sentence built from the packet (text route)
   Unknown keys are ignored. Team decision 2026-10-15: text route first, embedding later (checkpoint decides).
 
-Building from an mmdet config (A): type="LanguageModule" / "MockLanguageModule" are registered in PLUGIN_LAYERS.
+motion_planning_head builds it with build_language_module(cfg): type="mock" / "hf" / "LanguageModule".
 """
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -207,33 +207,3 @@ def build_language_module(cfg: Optional[Dict]) -> Optional[LanguageModuleBase]:
     if kind not in _REGISTRY:
         raise KeyError(f"unknown language module type '{kind}', choose from {sorted(_REGISTRY)}")
     return _REGISTRY[kind](**cfg)
-
-
-try:  # A builds the module with build_from_cfg(cfg, PLUGIN_LAYERS); the CPU test env has no mmcv
-    from mmcv.cnn.bricks.registry import PLUGIN_LAYERS
-
-    PLUGIN_LAYERS.register_module(name="LanguageModule", module=HFLanguageModule)
-    PLUGIN_LAYERS.register_module(name="MockLanguageModule", module=MockLanguageModule)
-except Exception:  # pragma: no cover
-    pass
-
-
-# ----------------------------------------------------------------------------------
-# helpers for A's per-sample feedback (adaLN PDF #3/#4): infer_batch -> [B] meta, per-sample fallback
-# ----------------------------------------------------------------------------------
-def feedback_meta(results: Sequence[InferResult], device=None):
-    """infer_batch results -> (ok [B] bool, meta [B] long). Failed samples get meta 0 and must keep the 1st pass."""
-    import torch
-
-    ok = torch.tensor([m is not None for m, _ in results], dtype=torch.bool, device=device)
-    meta = torch.tensor([m if m is not None else 0 for m, _ in results], dtype=torch.long, device=device)
-    return ok, meta
-
-
-def select_per_sample(ok, first, second):
-    """second[b] where ok[b] else first[b], for [B, ...] tensors or tuples / lists of them (e.g. _refine_once outputs)."""
-    import torch
-
-    if isinstance(first, (tuple, list)):
-        return type(first)(select_per_sample(ok, f, s) for f, s in zip(first, second))
-    return torch.where(ok.reshape([-1] + [1] * (first.dim() - 1)), second, first)
