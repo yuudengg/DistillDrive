@@ -103,8 +103,11 @@ attach_packet_dumper(model, "data/language/packets_train")   # val은 packets_va
 ```bash
 python tools/language/gen_reason_labels.py --pkl data/infos/nuscenes_infos_train.pkl \
    --meta-json data/language/meta_action_gt_train.json --data-root data/nuscenes \
-   --out data/language/reasons_train.jsonl --stride 4 --batch-size 8
+   --out data/language/reasons_train.jsonl --max-per-class 1500 --batch-size 8
 ```
+`--max-per-class 1500`: 클래스마다 최대 1500개, 회전은 전부 사용 (2026-10-17 train 기준 약 9,300개: 직진 6,000 / 우회전 1,852 / 좌회전 1,473).
+GT 확인 결과(train): 정답 명령 일치율 100%, 직진 86%(유지+직진 43%), 회전 14%, 정지+회전 0개 → 임계값은 기본값 유지.
+val은 실제 분포 그대로 평가하도록 `--max-per-class` 없이 전부 라벨링한다.
 
 ### 4) 학습 → 평가
 ```bash

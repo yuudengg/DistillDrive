@@ -122,3 +122,22 @@ def test_from_pretrained_8bit_builds_quant_config(monkeypatch):
     assert head.lm is lm
     with pytest.raises(ValueError):
         lang.LanguageHead.from_pretrained("x", load_in_4bit=True, load_in_8bit=True)
+
+
+def test_label_generation_caps_frequent_classes(tmp_path):
+    """--max-per-class: frequent classes thinned evenly over the scenes, rare classes (turns) kept in full."""
+    metas = [9] * 14 + [1] * 4 + [5] * 2  # like nuScenes: mostly keep+straight, few turns
+    infos = [dict(token=f"t{i:02d}", cams=dict(CAM_FRONT=dict(data_path=f"img{i}.jpg"))) for i in range(len(metas))]
+    with open(tmp_path / "infos.pkl", "wb") as f:
+        pickle.dump(dict(infos=infos), f)
+    (tmp_path / "meta.json").write_text(json.dumps({f"t{i:02d}": m for i, m in enumerate(metas)}))
+    out = tmp_path / "reasons.jsonl"
+    r = subprocess.run([sys.executable, str(TOOLS / "gen_reason_labels.py"), "--mock", "--pkl", str(tmp_path / "infos.pkl"),
+                        "--meta-json", str(tmp_path / "meta.json"), "--out", str(out), "--max-per-class", "5"],
+                       cwd=str(ROOT), capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    counts = {m: sum(row["meta_action"] == m for row in rows) for m in (9, 1, 5)}
+    assert counts == {9: 5, 1: 4, 5: 2}
+    kept9 = [row["sample_token"] for row in rows if row["meta_action"] == 9]
+    assert kept9[0] == "t00" and kept9[-1] >= "t11"  # spread over the whole list, not the first 5
