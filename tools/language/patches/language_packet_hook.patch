@@ -1,0 +1,141 @@
+diff --git a/projects/mmdet3d_plugin/models/motion/motion_planning_head.py b/projects/mmdet3d_plugin/models/motion/motion_planning_head.py
+index 263516e..31b6b81 100755
+--- a/projects/mmdet3d_plugin/models/motion/motion_planning_head.py
++++ b/projects/mmdet3d_plugin/models/motion/motion_planning_head.py
+@@ -29,6 +29,8 @@ from projects.mmdet3d_plugin.models.diffusion import DistributionModule, Predict
+ from ..attention import gen_sineembed_for_position
+ from ..blocks import linear_relu_ln
+ from ..instance_bank import topk
++from ..language.packet import LangPacketBuilder, split_packet  # noqa: F401  (also registers LanguageModule in PLUGIN_LAYERS)
++from ..language.language_module import feedback_meta, select_per_sample
+ 
+ 
+ @HEADS.register_module()
+@@ -75,6 +77,9 @@ class MotionPlanningHead(BaseModule):
+         language_module=None,
+         num_det=50,
+         num_map=10,
++        lang_packet_cfg=None,
++        lang_packet_refine_idx=-1,
++        lang_packet_dump=False,
+     ):
+ 
+         super(MotionPlanningHead, self).__init__()
+@@ -128,6 +133,14 @@ class MotionPlanningHead(BaseModule):
+             assert (self.adaln is not None and self.language_model is not None), (
+                 "language_module.enabled=True 인데 adaln/language_model 설정이 없습니다"
+             )
++        # language packet (C): scene_input for the feedback call, built only when the trigger fires. None = off.
++        # lang_packet_dump: also put a packet in planning_output (eval, for dumps; attach_packet_dumper sets it)
++        # lang_packet_refine_idx: which refine output that dump packet uses (-1 = last)
++        self.lang_packet_builder = build(lang_packet_cfg, PLUGIN_LAYERS)
++        self.lang_packet_refine_idx = lang_packet_refine_idx
++        self.lang_packet_dump = lang_packet_dump
++        if self.use_feedback:
++            assert self.lang_packet_builder is not None, "language feedback needs lang_packet_cfg (scene_input comes from the packet)"
+ 
+         if self.decouple_attn:
+             self.fc_before = nn.Linear(
+@@ -495,18 +508,17 @@ class MotionPlanningHead(BaseModule):
+                 # === STEP 2: feedback 2nd pass (A 통합) ===
+                 # 1차 plan_cls가 불확실할 때만, 메타행동(말)으로 조건을 만들어 refine만 재실행
+                 if self.use_feedback and self._trigger(plan_cls):
+-                    meta_idx, _sentence = self.language_model.infer(
+-                        self._scene_input(instance_feature, metas)
++                    # C: per-sample scene_input -> infer_batch; samples whose LM call failed keep the 1st pass
++                    results = self.language_model.infer_batch(
++                        self._scene_input(
++                            instance_feature, num_anchor, det_confidence, det_anchors, det_classification,
++                            map_instance_feature_selected, plan_query, plan_reg, plan_cls, metas,
++                        )
+                     )
+-                    cond = self.adaln(meta_idx)
+-                    (
+-                        motion_cls,
+-                        motion_reg,
+-                        plan_cls,
+-                        plan_reg,
+-                        plan_status,
+-                        plan_query,
+-                    ) = self._refine_once(
++                    ok, meta_idx = feedback_meta(results, device=plan_cls.device)
++                    cond = self.adaln(meta_idx)  # [B] meta-action -> (gamma, beta, alpha)
++                    first = (motion_cls, motion_reg, plan_cls, plan_reg, plan_status, plan_query)
++                    second = self._refine_once(
+                         i,
+                         instance_feature,
+                         anchor_embed,
+@@ -516,6 +528,14 @@ class MotionPlanningHead(BaseModule):
+                         plan_anchor_delta,
+                         cond=cond,
+                     )
++                    (
++                        motion_cls,
++                        motion_reg,
++                        plan_cls,
++                        plan_reg,
++                        plan_status,
++                        plan_query,
++                    ) = select_per_sample(ok, first, second)
+                 motion_classification.append(motion_cls)
+                 motion_prediction.append(motion_reg)
+                 planning_classification.append(plan_cls)
+@@ -523,6 +543,22 @@ class MotionPlanningHead(BaseModule):
+                 planning_status.append(plan_status)
+                 planning_feature.append(plan_query)
+ 
++        # =========== language packet for dumps (eval only, detached, does not change any driving output) ===========
++        lang_packet = None
++        if self.lang_packet_dump and self.lang_packet_builder is not None and not self.training:
++            ref = self.lang_packet_refine_idx
++            lang_packet = self.lang_packet_builder(
++                agent_feat=instance_feature[:, :num_anchor],
++                agent_conf=det_confidence,
++                agent_boxes=det_anchors,
++                agent_labels=det_classification.argmax(dim=-1),
++                ego_feat_modes=planning_feature[ref][:, 0],  # plan_query [B, 1, 3 * ME, D] -> [B, 3 * ME, D]
++                plan_reg=planning_prediction[ref],
++                plan_cls=planning_classification[ref],
++                cmd=metas.get("gt_ego_fut_cmd") if isinstance(metas, dict) else None,
++                map_feat=map_instance_feature_selected,
++            )
++
+         self.instance_queue.cache_motion(instance_feature[:, :num_anchor], det_output, metas)
+         self.instance_queue.cache_planning(instance_feature[:, num_anchor:], plan_status)
+ 
+@@ -542,6 +578,8 @@ class MotionPlanningHead(BaseModule):
+             "period": self.instance_queue.ego_period,
+             "anchor_queue": self.instance_queue.ego_anchor_queue,
+         }
++        if lang_packet is not None:
++            planning_output["lang_packet"] = lang_packet
+         # Add distribution to calculate the gradient
+         if self.vae_model is True:
+             planning_output["distribution"] = output_distribution
+@@ -554,10 +592,22 @@ class MotionPlanningHead(BaseModule):
+             conf = plan_cls.sigmoid()
+             return bool(conf.max().item() < self.trigger_threshold)
+ 
+-    def _scene_input(self, instance_feature, metas):
+-        """언어모듈 입력. 팀 합의: 1차는 '텍스트 요약' 형식.
+-        TODO(C): scene_input 최종 형식(텍스트 요약) 확정 후 여기 맞추기."""
+-        return {"instance_feature": instance_feature, "metas": metas}
++    def _scene_input(self, instance_feature, num_anchor, det_confidence, det_anchors, det_classification,
++                     map_feat, plan_query, plan_reg, plan_cls, metas):
++        """언어모듈 입력 (C): 1차 refine 결과로 패킷을 만들어 샘플별 dict 리스트로 돌려준다.
++        텍스트 경로든 임베딩 경로든 같은 dict이고, 문장 변환은 언어모듈 안에서 한다."""
++        packet = self.lang_packet_builder(
++            agent_feat=instance_feature[:, :num_anchor],
++            agent_conf=det_confidence,
++            agent_boxes=det_anchors,
++            agent_labels=det_classification.argmax(dim=-1),
++            ego_feat_modes=plan_query[:, 0],  # [B, 1, 3 * ME, D] -> [B, 3 * ME, D]
++            plan_reg=plan_reg,
++            plan_cls=plan_cls,
++            cmd=metas.get("gt_ego_fut_cmd") if isinstance(metas, dict) else None,
++            map_feat=map_feat,
++        )
++        return [split_packet(packet, b) for b in range(plan_reg.shape[0])]
+ 
+     def _refine_once(
+         self,

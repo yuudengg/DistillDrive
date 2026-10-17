@@ -53,24 +53,33 @@ tools/language/
   gen_reason_labels.py    Qwen2.5-VL(3B/7B)로 근거 라벨 생성                    ← GPU
   train_language.py       단계 1/2 학습                                          ← GPU (--tiny는 CPU)
   eval_language.py        생성 품질 + 1차 궤적 메타행동 정확도                    ← GPU
-tests/language/   CPU 테스트 3개 (pipeline, language_module, hf_language_module)
+tools/language/patches/  A의 motion_planning_head.py에 C를 연결하는 패치 (A가 적용)
+tests/language/   CPU 테스트 (pipeline, language_module, hf_language_module, text_route, a_integration)
 ```
-주행 모델 쪽 연결(`motion_planning_head.py`에 패킷 hook 추가)은 파일 소유권 규칙에 따라 A가 적용한다 (패치는 A에게 따로 전달).
+주행 모델 쪽 연결(`motion_planning_head.py`)은 파일 소유권 규칙에 따라 A가 `tools/language/patches/`로 적용한다.
 
 ## 4. 적용 순서
 
 필요 패키지: `torch`(패킷 덤프는 1.x에서도 동작, 언어모델 학습은 2.x 기준으로 확인), `transformers`(Qwen2.5-VL은 4.49 이상), `peft`(단계 2 LoRA), `accelerate`(device_map 사용 시), 라벨 생성에는 `pillow`.
 
 ### 0) 주행 모델 쪽 연결 (A 담당)
-`motion_planning_head.py`에 패킷 hook을 넣는 변경은 A가 적용한다. 바뀌는 곳은 5군데:
-(1) import 1줄 (2) 생성자 인자 2개 (3) 빌더 생성 4줄 (4) forward 끝부분 패킷 생성 블록 (5) planning_output 한 줄.
+A의 되먹임 통합(`a8930b8`) 위에 C를 연결하는 패치. 저장소 맨 위에서:
+```bash
+python tools/language/patches/apply_language_patch.py --check   # 위치만 확인
+python tools/language/patches/apply_language_patch.py           # 적용 (.bak 백업)
+```
+바뀌는 곳: (1) import (패킷 빌더, `split_packet`, 되먹임 도우미; 이 import로 `LanguageModule`이 `PLUGIN_LAYERS`에 등록됨)
+(2) 생성자 인자 `lang_packet_cfg`, `lang_packet_refine_idx` (3) 빌더 생성 (4) 되먹임 호출을 샘플별 `infer_batch`로, 실패한 샘플은 1차 결과 유지
+(5) A의 TODO(C) `_scene_input`: 1차 refine 결과로 패킷을 만들어 샘플별 dict 리스트 반환 (트리거가 걸릴 때만 계산)
+(6) forward 끝 패킷: `lang_packet_dump=True`일 때만 (기본 꺼짐, `attach_packet_dumper`가 자동으로 켬). 평소엔 매 프레임 추가 계산 없음.
 C의 파일(language/, tools/language, tests/language)은 이 연결 없이도 CPU 테스트가 돈다.
+A의 config에서 언어모듈은 `language_model=dict(type="LanguageModule", ckpt_dir=..., lm_path=..., device="cuda")` 또는 `dict(type="MockLanguageModule", mode="cycle", fail_every=4)`.
 
 config에 추가 (끄려면 이 줄을 빼면 됨):
 ```python
 lang_packet_cfg=dict(type="LangPacketBuilder", num_agents=12, num_map=6, ego_fut_ts=6, ego_fut_mode=6,
                      meta_action=dict(dt=0.5, lat_thresh=2.0)),
-lang_packet_refine_idx=-1,   # 되먹임 연결 후에는 2 (= refine 3 직후)
+lang_packet_refine_idx=-1,   # 덤프 패킷에 쓸 refine 출력 (-1 = 마지막)
 ```
 
 ### 1) CPU: 테스트 + GT 메타행동 + 임계값 분포 (언어팀 노트북)
@@ -135,8 +144,18 @@ lm = build_language_module(cfg)            # cfg=None → 꺼짐(기본값)
 meta_idx, reason = lm.infer(scene_input)   # meta_idx: 0~11 int (문서 번호 체계, meta_spec.py) / 파싱 실패 시 scene_input의 규칙 메타행동으로 대체, 그것도 없으면 (None, None)
 ```
 - A·B용 mock: `dict(type="mock", mode="fixed"|"cycle"|"echo", fail_every=N, delay_s=...)`
-- 실제 모델: `dict(type="hf", ckpt_dir=..., lm_path="Qwen/Qwen1.5-1.8B-Chat", load_in_8bit=True)`
-  현재는 임베딩 경로(scene/scene_mask/scene_type/traj, 배치 차원 없이)만 지원. 텍스트 요약 경로는 회의 결정 후 추가.
+- 실제 모델: `dict(type="hf", ckpt_dir=..., lm_path="Qwen/Qwen1.5-1.8B-Chat", device="cuda")` (메모리가 부족하면 `load_in_8bit=True`; 8bit는 자동으로 GPU). `device`를 빼면 GPU가 있을 때 GPU를 쓴다.
+  `scene_input`은 두 경로 모두 같은 패킷 dict(`split_packet` 결과)다. 체크포인트가 어느 경로로 학습됐는지(`language_head.json`의 `input_mode`)에 따라 C 안에서 처리가 갈린다.
+  - 임베딩 경로(`input_mode="embed"`): `scene`/`scene_mask`/`scene_type`/`traj`를 투영기로 LM에 넣는다.
+  - 텍스트 경로(`input_mode="text"`, 2026-10-15 팀 결정: 텍스트로 먼저 돌려 보고 임베딩으로 전환): `scene_input["text"]`가 있으면 그대로 쓰고, 없으면 `traj`/`agent_xy`/`agent_labels`/`agent_conf`로 문장을 만든다(`prompt.scene_text_from_packet`). 투영기 없이 LoRA만 학습한다.
+  - 텍스트 경로 학습은 패킷 없이 info pkl(GT 박스 + GT 미래 궤적)로 문장을 만든다. `--packets` 대신 `--pkl`, 단계는 `--stage 2`만 가능:
+    ```bash
+    python tools/language/train_language.py --stage 2 --predict-action \
+       --labels data/language/reasons_train.jsonl --pkl data/infos/nuscenes_infos_train.pkl \
+       --val-labels data/language/reasons_val.jsonl --val-pkl data/infos/nuscenes_infos_val.pkl \
+       --out work_dirs/language/text --epochs 3 --batch-size 8 --lr 2e-4
+    ```
+    학습 문장은 GT에서, 추론 문장은 주행 모델 예측에서 나오지만 형식은 같은 함수(`prompt.describe_scene`)로 만든다.
 - 번호 체계: 팀 확정 순서 우(0)/좌(1)/직(2) (A 인터페이스 스펙 v2). 라벨·패킷·LM 입출력·`infer()` 반환값 모두 같은 번호를 쓴다. `from_rls_index`/`to_rls_index`는 예전 호출부 호환용으로 남겨 둔 항등 함수다.
 
 학습·평가 플래그:

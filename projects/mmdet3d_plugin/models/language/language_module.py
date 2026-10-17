@@ -11,21 +11,22 @@ Contract for callers (A's trigger code):
   * infer() never raises on bad LM output -> the caller decides the fallback (e.g. keep the 1st-pass trajectory)
   * no gradient flows out of this module
 
-scene_input (NOT FINAL - the team still decides 'text summary vs query embedding'):
-  a dict; keys a module may read:
-    "scene"      : [L, D] float   scene tokens (ego / agents / map) from the dump
-    "scene_mask" : [L] bool
-    "scene_type" : [L] long       0 ego, 1 agent, 2 map
-    "traj"       : [T, 2] float   1st-pass trajectory (positions)
-    "text"       : str            text summary of the scene (if the text route is chosen)
-    "meta_idx"   : int            rule-based meta-action from B (optional, used by MockLanguageModule 'echo')
-  Unknown keys are ignored, so A and B can already pass whatever they have.
+scene_input = one sample of a LangPacketBuilder packet (packet.split_packet), the same for both routes:
+    "traj"       : [T, 2] float   1st-pass trajectory (positions)               text + embed route
+    "agent_xy" / "agent_labels" / "agent_conf"   detected agents               text route
+    "scene" / "scene_mask" / "scene_type"        projected scene tokens        embed route
+    "meta_action": rule meta-action (fallback when the LM output cannot be parsed)
+    "text"       : str            optional: overrides the sentence built from the packet (text route)
+  Unknown keys are ignored. Team decision 2026-10-15: text route first, embedding later (checkpoint decides).
+
+Building from an mmdet config (A): type="LanguageModule" / "MockLanguageModule" are registered in PLUGIN_LAYERS.
 """
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .meta_spec import NUM_META, from_rls_index, meta_index, meta_name
 from .output_parser import ParseResult, parse_output
+from .prompt import scene_text_from_packet
 
 InferResult = Tuple[Optional[int], Optional[str]]
 
@@ -108,8 +109,9 @@ class HFLanguageModule(LanguageModuleBase):
     Flow:  scene_input -> LanguageHead (projector + LM, prompt does NOT reveal the meta-action) -> generate -> parse_output
     Train the head with  train_language.py --predict-action  (target = output_parser.format_target(meta, reason)).
 
-    Only the embedding route (scene / scene_mask / scene_type / traj) is implemented.
-    TODO if the team picks the text route: build the prompt from scene_input["text"] instead.
+    scene_input is the same per-sample packet dict for both routes (split_packet output), so A never changes:
+      embed checkpoint : scene / scene_mask / scene_type / traj are projected into the LM
+      text checkpoint  : scene_input["text"] if given, else built here from traj / agent_xy / agent_labels / agent_conf
     """
 
     def __init__(
@@ -121,13 +123,16 @@ class HFLanguageModule(LanguageModuleBase):
         max_new_tokens: int = 64,
         load_in_4bit: bool = False,
         load_in_8bit: bool = False,
-        device: Optional[str] = None,
+        device: Optional[str] = None,  # None: GPU if available for a head loaded here (an injected head stays put)
     ):
-        if head is None:
+        loaded_here = head is None
+        if loaded_here:
             head = self._load_head(ckpt_dir, lm_path, load_in_4bit, load_in_8bit)
         assert head.predict_action, "this checkpoint was trained without --predict-action: it cannot output a meta-action"
-        if device is not None and not (load_in_4bit or load_in_8bit):  # quantized weights are already on the GPU
-            head.to(device)
+        if not (load_in_4bit or load_in_8bit) and (device is not None or loaded_here):  # quantized is already on the GPU
+            import torch
+
+            head.to(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.head = head.eval()
         self.lenient, self.max_new_tokens = lenient, max_new_tokens
         self.last_parse: List[ParseResult] = []
@@ -156,8 +161,11 @@ class HFLanguageModule(LanguageModuleBase):
     def infer_batch(self, scene_inputs: Sequence[Dict]) -> List[InferResult]:
         import torch
 
-        batch = {k: torch.stack([torch.as_tensor(x[k]) for x in scene_inputs]) for k in ("scene", "scene_mask", "scene_type", "traj")}
-        batch["scene"], batch["traj"] = batch["scene"].float(), batch["traj"].float()
+        if self.head.input_mode == "text":
+            batch = {"text": [x["text"] if "text" in x else scene_text_from_packet(x) for x in scene_inputs]}
+        else:
+            batch = {k: torch.stack([torch.as_tensor(x[k]) for x in scene_inputs]) for k in ("scene", "scene_mask", "scene_type", "traj")}
+            batch["scene"], batch["traj"] = batch["scene"].float(), batch["traj"].float()
         texts = self.head.generate(batch, max_new_tokens=self.max_new_tokens)
         self.last_parse = [parse_output(t, lenient=self.lenient) for t in texts]
         out = []
@@ -199,3 +207,33 @@ def build_language_module(cfg: Optional[Dict]) -> Optional[LanguageModuleBase]:
     if kind not in _REGISTRY:
         raise KeyError(f"unknown language module type '{kind}', choose from {sorted(_REGISTRY)}")
     return _REGISTRY[kind](**cfg)
+
+
+try:  # A builds the module with build_from_cfg(cfg, PLUGIN_LAYERS); the CPU test env has no mmcv
+    from mmcv.cnn.bricks.registry import PLUGIN_LAYERS
+
+    PLUGIN_LAYERS.register_module(name="LanguageModule", module=HFLanguageModule)
+    PLUGIN_LAYERS.register_module(name="MockLanguageModule", module=MockLanguageModule)
+except Exception:  # pragma: no cover
+    pass
+
+
+# ----------------------------------------------------------------------------------
+# helpers for A's per-sample feedback (adaLN PDF #3/#4): infer_batch -> [B] meta, per-sample fallback
+# ----------------------------------------------------------------------------------
+def feedback_meta(results: Sequence[InferResult], device=None):
+    """infer_batch results -> (ok [B] bool, meta [B] long). Failed samples get meta 0 and must keep the 1st pass."""
+    import torch
+
+    ok = torch.tensor([m is not None for m, _ in results], dtype=torch.bool, device=device)
+    meta = torch.tensor([m if m is not None else 0 for m, _ in results], dtype=torch.long, device=device)
+    return ok, meta
+
+
+def select_per_sample(ok, first, second):
+    """second[b] where ok[b] else first[b], for [B, ...] tensors or tuples / lists of them (e.g. _refine_once outputs)."""
+    import torch
+
+    if isinstance(first, (tuple, list)):
+        return type(first)(select_per_sample(ok, f, s) for f, s in zip(first, second))
+    return torch.where(ok.reshape([-1] + [1] * (first.dim() - 1)), second, first)

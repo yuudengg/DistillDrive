@@ -117,7 +117,7 @@ def describe_objects(
         dist = (x * x + y * y) ** 0.5
         if dist > max_dist:
             continue
-        name = CLASS_NAMES[int(lab)].replace("_", " ")
+        name = (lab if isinstance(lab, str) else CLASS_NAMES[int(lab)]).replace("_", " ")
         fwd = "ahead" if y >= 0 else "behind"
         side = "right" if x >= 0 else "left"
         items.append((dist, f"{name} {abs(round(y))}m {fwd}, {abs(round(x))}m {side}"))
@@ -125,6 +125,44 @@ def describe_objects(
     if not items:
         return None
     return "; ".join(text for _, text in items[:topn])
+
+
+# ----------------------------------------------------------------------------------
+# text route: the whole scene as text (LM input instead of projected scene tokens)
+# ----------------------------------------------------------------------------------
+TEXT_PREFIX = "Driving scene:"
+
+
+def describe_scene(traj: Sequence, xy: Sequence = (), labels: Sequence = (), conf: Optional[Sequence] = None,
+                   topn: int = 8) -> str:
+    """'Planned path (x right, y forward, m, every 0.5s): (0.0,4.1) ... \\nNearby objects: car 12m ahead, 3m left; ...'
+
+    One formatter for both sources so training text (GT pkl) and inference text (driving-model packet) match.
+    traj: [T, 2] positions. labels: class ids or class names. conf None = all detections kept (GT boxes).
+    """
+    pts = " ".join(f"({x:.1f},{y:.1f})" for x, y in _to_list(traj))
+    text = f"Planned path (x right, y forward, m, every 0.5s): {pts}"
+    labels = _to_list(labels)
+    conf = [1.0] * len(labels) if conf is None else conf
+    objects = describe_objects(xy, labels, conf, topn=topn) if labels else None
+    return text + f"\n{_HEADERS['en']['objects']}: {objects or 'none'}"
+
+
+def scene_text_from_info(info: dict, topn: int = 8) -> str:
+    """Training text from a nuScenes info dict (GT boxes + GT ego future), no driving model needed."""
+    traj, x, y = [], 0.0, 0.0
+    for dx, dy in _to_list(info["gt_ego_fut_trajs"]):  # per-step offsets (nuscenes_converter.py)
+        x, y = x + dx, y + dy
+        traj.append((x, y))
+    valid = _to_list(info.get("valid_flag", [True] * len(info["gt_names"])))
+    boxes, names = _to_list(info["gt_boxes"]), _to_list(info["gt_names"])
+    keep = [i for i, v in enumerate(valid) if v and names[i] in CLASS_NAMES]
+    return describe_scene(traj, [boxes[i][:2] for i in keep], [names[i] for i in keep], topn=topn)
+
+
+def scene_text_from_packet(pkt: dict, topn: int = 8) -> str:
+    """Inference text from one packet (split_packet output): the same fields A already passes as scene_input."""
+    return describe_scene(pkt["traj"], pkt["agent_xy"], pkt["agent_labels"], pkt["agent_conf"], topn=topn)
 
 
 # ----------------------------------------------------------------------------------

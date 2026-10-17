@@ -46,7 +46,8 @@ def main():
     ap.add_argument("--lm", default="Qwen/Qwen1.5-1.8B-Chat")
     ap.add_argument("--tiny", action="store_true")
     ap.add_argument("--labels", required=True)
-    ap.add_argument("--packets", required=True)
+    ap.add_argument("--packets", default=None, help="packet dir (embedding route)")
+    ap.add_argument("--pkl", default=None, help="nuScenes info pkl (text route; meta acc is then trivially 1.0)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--meta-source", choices=["gt", "pred"], default="pred")
     ap.add_argument("--with-objects", action="store_true")
@@ -62,26 +63,32 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=48)
     ap.add_argument("--max-samples", type=int, default=None)
     args = ap.parse_args()
+    if bool(args.packets) == bool(args.pkl):
+        ap.error("give exactly one of --packets (embedding route) or --pkl (text route)")
 
     lang = load_language_package()
     from importlib import import_module
 
     ds_mod = import_module(lang.__name__ + ".dataset")
-    ds = lang.ReasonPacketDataset(
-        args.labels, args.packets, meta_source=args.meta_source, with_objects=args.with_objects, lang=args.lang,
-        validate=False, max_samples=args.max_samples,
-    )
+    if args.pkl:
+        ds = lang.ReasonTextDataset(args.labels, args.pkl, validate=False, max_samples=args.max_samples)
+    else:
+        ds = lang.ReasonPacketDataset(
+            args.labels, args.packets, meta_source=args.meta_source, with_objects=args.with_objects, lang=args.lang,
+            validate=False, max_samples=args.max_samples,
+        )
     print("[data]", ds.stats)
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from train_language import build_head  # reuse the same construction
 
-    head = build_head(args, lang, corpus_for_tiny=[r["reason"] for r in ds.rows])
+    head = build_head(args, lang, corpus_for_tiny=[r["reason"] for r in ds.rows] + list(getattr(ds, "texts", {}).values()))
     head.load(args.ckpt)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.tiny else "cpu")
     if not (args.qlora or args.load_8bit):
         head.to(device)
-    head.projector.to(device)
+    if head.projector is not None:
+        head.projector.to(device)
     head.eval()
 
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, collate_fn=lang.collate_fn)

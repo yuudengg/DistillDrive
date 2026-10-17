@@ -252,6 +252,7 @@ class PacketDumper:
         head = heads[0]
         if getattr(head, "lang_packet_builder", None) is None:
             raise RuntimeError("head.lang_packet_builder is None: set lang_packet_cfg in the config")
+        head.lang_packet_dump = True  # the end-of-forward packet is built only while dumping
         orig = head.forward  # bound method; nn.Module.__call__ picks up the instance attribute below
 
         def forward(*args, **kwargs):
@@ -266,6 +267,7 @@ class PacketDumper:
     def remove(self):
         if self.head is not None:
             del self.head.forward  # back to the class method
+            self.head.lang_packet_dump = False
             self.head = None
 
 

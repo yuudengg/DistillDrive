@@ -313,10 +313,11 @@ def test_packet_dumper_hook(tmp_path):
         def __init__(self):
             super().__init__()
             self.lang_packet_builder = builder
+            self.lang_packet_dump = False  # like the patched head: packet only while dumping
 
         def forward(self, det_output, map_output, feature_maps, metas, *rest):
             inp = make_inputs(seed=5)
-            return {}, {"lang_packet": builder(**inp)}
+            return {}, ({"lang_packet": builder(**inp)} if self.lang_packet_dump else {})
 
     class Wrapper(torch.nn.Module):
         def __init__(self):
@@ -327,7 +328,9 @@ def test_packet_dumper_hook(tmp_path):
             return self.head(None, None, None, metas)
 
     model = Wrapper()
+    model({"img_metas": [{"sample_idx": "n"}]})  # no dumper -> no packet is built
     dumper = packet_mod.attach_packet_dumper(model, str(tmp_path / "pk"))
+    assert model.head.lang_packet_dump is True
     model({"img_metas": [{"sample_idx": "a"}, {"sample_idx": "b"}, {"sample_idx": "c"}]})
     assert sorted(p.name for p in (tmp_path / "pk").iterdir()) == ["a.pt", "b.pt", "c.pt"]
     loaded = packet_mod.load_packet(str(tmp_path / "pk" / "b.pt"))
@@ -335,6 +338,7 @@ def test_packet_dumper_hook(tmp_path):
     model({"img_metas": [{"sample_idx": "a"}, {"sample_idx": "b"}, {"sample_idx": "c"}]})  # no overwrite by default
     assert dumper.num_saved == 3
     dumper.remove()
+    assert model.head.lang_packet_dump is False
     model({"img_metas": [{"sample_idx": "x"}, {"sample_idx": "y"}, {"sample_idx": "z"}]})  # removed -> nothing saved
     assert not (tmp_path / "pk" / "x.pt").exists()
     # metas passed as a keyword argument
