@@ -9,6 +9,8 @@ from projects.mmdet3d_plugin.core.box3d import *
 from projects.mmdet3d_plugin.models.detection3d.decoder import *
 from projects.mmdet3d_plugin.datasets.utils import box3d_to_corners
 
+from .safety_check import pool_candidates, choose
+
 
 @BBOX_CODERS.register_module()
 class SparseBox3DMotionDecoder(SparseBox3DDecoder):
@@ -132,21 +134,33 @@ class HierarchicalPlanningDecoder(object):
         bs = classification.shape[0] # batch size
         classification = classification.reshape(bs, 3, self.ego_fut_mode) # [B, C, M]
         prediction = prediction.reshape(bs, 3, self.ego_fut_mode, self.ego_fut_ts, 2).cumsum(dim=-2) # [B, C, M, T, 2]
-        classification, final_planning = self.select(det_output, motion_output, classification, prediction, data)
+        # rollback (B, safety_check.py): head passes the 1st pass only when counterfactual_check is on
+        first = planning_output.get("rollback")
+        if first is not None:
+            first = dict(
+                classification=first["classification"].reshape(bs, 3, self.ego_fut_mode),
+                prediction=first["prediction"].reshape(bs, 3, self.ego_fut_mode, self.ego_fut_ts, 2).cumsum(dim=-2),
+                use=first["use"],
+                mode=first.get("mode", "pool"),
+            )
+        classification, final_planning, from_first = self.select(
+            det_output, motion_output, classification, prediction, data, first=first
+        )
         anchor_queue = planning_output["anchor_queue"]
         anchor_queue = torch.stack(anchor_queue, dim=2)
         period = planning_output["period"]
         output = []
         for i, (cls, pred) in enumerate(zip(classification, prediction)):
-            output.append(
-                {
-                    "planning_score": cls.sigmoid().cpu(),
-                    "planning": pred.cpu(),
-                    "final_planning": final_planning[i].cpu(),
-                    "ego_period": period[i].cpu(),
-                    "ego_anchor_queue": decode_box(anchor_queue[i]).cpu(),
-                }
-            )
+            result = {
+                "planning_score": cls.sigmoid().cpu(),
+                "planning": pred.cpu(),
+                "final_planning": final_planning[i].cpu(),
+                "ego_period": period[i].cpu(),
+                "ego_anchor_queue": decode_box(anchor_queue[i]).cpu(),
+            }
+            if from_first is not None:
+                result["rollback"] = bool(from_first[i])  # True = 1st pass trajectory was chosen
+            output.append(result)
 
         return output
 
@@ -157,6 +171,7 @@ class HierarchicalPlanningDecoder(object):
         plan_cls,
         plan_reg,
         data,
+        first=None,
     ):
         det_classification = det_output["classification"][-1].sigmoid()
         det_anchors = det_output["prediction"][-1]
@@ -172,6 +187,28 @@ class HierarchicalPlanningDecoder(object):
         plan_cls = plan_cls[bs_indices, cmd]
         plan_reg = plan_reg[bs_indices, cmd]
 
+        if first is not None:
+            # rollback: pool 2nd + 1st pass candidates and judge them with the same collision check
+            # (always rescored here, the collision check is what the rollback is based on)
+            pool_cls, pool_reg = pool_candidates(
+                plan_cls,
+                plan_reg,
+                first["classification"][bs_indices, cmd],
+                first["prediction"][bs_indices, cmd],
+                first["use"],
+            )
+            collided = self.collision_mask(
+                pool_reg,
+                motion_cls,
+                motion_reg,
+                det_anchors,
+                det_confidence,
+            )
+            scored_cls = self.collision_penalty(pool_cls, collided)
+            final_planning, from_first = choose(scored_cls, collided, pool_reg, first["use"], first["mode"])
+            plan_cls_full[bs_indices, cmd] = scored_cls[:, :self.ego_fut_mode]
+            return plan_cls_full, final_planning, from_first
+
         # rescore
         if self.use_rescore:
             plan_cls = self.rescore(
@@ -185,7 +222,7 @@ class HierarchicalPlanningDecoder(object):
         plan_cls_full[bs_indices, cmd] = plan_cls
         mode_idx = plan_cls.argmax(dim=-1)
         final_planning = plan_reg[bs_indices, mode_idx]
-        return plan_cls_full, final_planning
+        return plan_cls_full, final_planning, None
 
     def rescore(
         self, 
@@ -201,7 +238,47 @@ class HierarchicalPlanningDecoder(object):
         num_motion_mode=1,
         offset=0.5,
     ):
-        
+        # split into collision_mask + collision_penalty so the rollback can read the
+        # collision flags directly (same result as before)
+        col = self.collision_mask(
+            plan_reg,
+            motion_cls,
+            motion_reg,
+            det_anchors,
+            det_confidence,
+            score_thresh=score_thresh,
+            static_dis_thresh=static_dis_thresh,
+            dim_scale=dim_scale,
+            num_motion_mode=num_motion_mode,
+            offset=offset,
+        )
+        return self.collision_penalty(plan_cls, col)
+
+    @staticmethod
+    def collision_penalty(plan_cls, col):
+        """Lower collided candidates by 999. If all modes of a sample collide, leave them as is."""
+        all_col = col.all(dim=-1)
+        col = col.clone()
+        col[all_col] = False # for case that all modes collide, no need to rescore
+        score_offset = col.float() * -999
+        plan_cls = plan_cls + score_offset
+        return plan_cls
+
+    def collision_mask(
+        self,
+        plan_reg,
+        motion_cls,
+        motion_reg,
+        det_anchors,
+        det_confidence,
+        score_thresh=0.5,
+        static_dis_thresh=0.5,
+        dim_scale=1.1,
+        num_motion_mode=1,
+        offset=0.5,
+    ):
+        """[bs, num_mode] bool, True = the ego candidate overlaps a predicted agent box at some step."""
+
         def cat_with_zero(traj):
             zeros = traj.new_zeros(traj.shape[:-2] + (1, 2))
             traj_cat = torch.cat([zeros, traj], dim=-2)
@@ -232,9 +309,9 @@ class HierarchicalPlanningDecoder(object):
             return yaw.unsqueeze(-1)
         
         ## ego
-        bs = plan_reg.shape[0]
+        bs, num_mode = plan_reg.shape[:2] # num_mode = ego_fut_mode, or 2x for the rollback pool
         plan_reg_cat = cat_with_zero(plan_reg)
-        ego_box = det_anchors.new_zeros(bs, self.ego_fut_mode, self.ego_fut_ts + 1, 7)
+        ego_box = det_anchors.new_zeros(bs, num_mode, self.ego_fut_ts + 1, 7)
         ego_box[..., [X, Y]] = plan_reg_cat
         ego_box[..., [W, L, H]] = ego_box.new_tensor([4.08, 1.73, 1.56]) * dim_scale
         ego_box[..., [YAW]] = get_yaw(plan_reg_cat)
@@ -271,11 +348,7 @@ class HierarchicalPlanningDecoder(object):
         col = check_collision(ego_box, motion_box)
         col = col.reshape(bs, num_anchor, num_motion_mode, num_ego_mode, ts).permute(0, 3, 1, 2, 4)
         col = col.flatten(2, -1).any(dim=-1)
-        all_col = col.all(dim=-1)
-        col[all_col] = False # for case that all modes collide, no need to rescore
-        score_offset = col.float() * -999
-        plan_cls = plan_cls + score_offset
-        return plan_cls
+        return col
 
 
 def check_collision(boxes1, boxes2):

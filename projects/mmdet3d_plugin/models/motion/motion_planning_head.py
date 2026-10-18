@@ -123,6 +123,9 @@ class MotionPlanningHead(BaseModule):
         self.use_feedback = lang_cfg.get("enabled", False)
         self.split = lang_cfg.get("split", None)
         self.trigger_threshold = lang_cfg.get("trigger_threshold", 0.5)
+        # 롤백(B, safety_check.py): 켜면 1차 결과도 decoder로 넘겨서 1차+2차 후보를 같이 충돌 검사
+        self.counterfactual_check = lang_cfg.get("counterfactual_check", False)
+        self.rollback_mode = lang_cfg.get("rollback_mode", "pool")  # "pool" / "collision"
         # 켜져 있을 때만 만든다 (off면 언어 모델(1.8B)도 안 불러옴)
         self.adaln = None
         self.language_model = None
@@ -434,6 +437,7 @@ class MotionPlanningHead(BaseModule):
         planning_status = []
         planning_feature = []
         planning_memory_feature = []
+        planning_rollback = None
         for i, op in enumerate(self.operation_order):
             if self.layers[i] is None:
                 if op == "distribution":
@@ -479,6 +483,7 @@ class MotionPlanningHead(BaseModule):
                     key_pos=map_anchor_embed_selected,
                 )  # [B, N1 + M_E, D]
             elif op == "refine":
+                planning_rollback = None  # 롤백용 1차 결과 (마지막 refine 것만 decoder가 씀)
                 # 1st pass (cond=None): identical to the original refine block
                 (
                     motion_cls,
@@ -525,6 +530,14 @@ class MotionPlanningHead(BaseModule):
                             plan_status,
                             plan_query,
                         ) = [self._select(use, s, f) for s, f in zip(second, first)]
+                        if self.counterfactual_check:
+                            # 롤백(B): 덮어쓰기 전 1차 plan_cls/plan_reg와 2차를 쓴 샘플 mask를 남김
+                            planning_rollback = dict(
+                                classification=first[2],
+                                prediction=first[3],
+                                use=use,
+                                mode=self.rollback_mode,
+                            )
                 motion_classification.append(motion_cls)
                 motion_prediction.append(motion_reg)
                 planning_classification.append(plan_cls)
@@ -554,6 +567,9 @@ class MotionPlanningHead(BaseModule):
         # Add distribution to calculate the gradient
         if self.vae_model is True:
             planning_output["distribution"] = output_distribution
+        # 롤백(B): 2차를 쓴 샘플이 있을 때만 넣음 -> 없으면 decoder는 원래 그대로
+        if self.use_feedback and planning_rollback is not None:
+            planning_output["rollback"] = planning_rollback
 
         return motion_output, planning_output
 

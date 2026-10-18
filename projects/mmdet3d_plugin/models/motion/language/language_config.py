@@ -33,4 +33,6 @@ language_module = dict(
 
     # --- 안전장치(⑧, B 제공, 선택) ---
     counterfactual_check=False,  # 2차 궤적이 1차보다 나은지 확인, 나쁘면 롤백 (추후 on)
+    rollback_mode="pool",        # B(safety_check.py): "pool" = 1차+2차 후보 12개를 충돌 검사 후 최고 점수
+                                 #                     "collision" = 2차가 충돌이고 1차는 안전할 때만 1차로
 )
