@@ -30,6 +30,7 @@ from ..attention import gen_sineembed_for_position
 from ..blocks import linear_relu_ln
 from ..instance_bank import topk
 from ..language import build_language_module
+from .safety_check import check_rollback_cfg
 
 
 @HEADS.register_module()
@@ -126,6 +127,7 @@ class MotionPlanningHead(BaseModule):
         # 롤백(B, safety_check.py): 켜면 1차 결과도 decoder로 넘겨서 1차+2차 후보를 같이 충돌 검사
         self.counterfactual_check = lang_cfg.get("counterfactual_check", False)
         self.rollback_mode = lang_cfg.get("rollback_mode", "pool")  # "pool" / "collision"
+        check_rollback_cfg(lang_cfg)  # 롤백(B): 설정 값 오타·조합 실수를 만들 때 바로 확인 (학습 전에 멈춤)
         # 켜져 있을 때만 만든다 (off면 언어 모델(1.8B)도 안 불러옴)
         self.adaln = None
         self.language_model = None

@@ -215,5 +215,27 @@ out = dec.decode(det_output, motion_output, planning_output, data)
 check([o["rollback"] for o in out] == [True, False, False, True], f"rollback flags {[o['rollback'] for o in out]}")
 check(abs(float(out[0]["final_planning"][-1, 1]) - STOP) < 1e-4, "sample0 final_planning is the 1st pass STOP")
 
+# ---------- 5. check_rollback_cfg: config mistakes fail when the head is built ----------
+print("== 5. check_rollback_cfg ==")
+
+
+def fails(cfg):
+    try:
+        safety.check_rollback_cfg(cfg)
+    except AssertionError:
+        return True
+    return False
+
+
+check(not fails({}), "empty language_module (all defaults) -> ok")
+check(not fails(dict(enabled=False, counterfactual_check=False, rollback_mode="pool")),
+      "default config of language_config.py -> ok")
+for mode in safety.ROLLBACK_MODES:
+    check(not fails(dict(enabled=True, counterfactual_check=True, rollback_mode=mode)), f"rollback on, mode={mode} -> ok")
+check(fails(dict(rollback_mode="colision")), "value typo 'colision' -> error (even with rollback off)")
+check(fails(dict(enabled=True, counterfactual_check=True, rollback_mode="Pool")), "value typo 'Pool' -> error")
+check(fails(dict(enabled=False, counterfactual_check=True)), "counterfactual_check=True but enabled=False -> error")
+check(set(safety.ROLLBACK_KEYS) == {"counterfactual_check", "rollback_mode"}, "ROLLBACK_KEYS")
+
 print("\nALL OK" if ok else "\nSOME FAILED")
 sys.exit(0 if ok else 1)

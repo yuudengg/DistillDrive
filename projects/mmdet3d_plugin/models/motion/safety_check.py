@@ -19,6 +19,24 @@ Inference only (decoder), no effect on training / loss.
 import torch
 
 ROLLBACK_MODES = ("pool", "collision")
+# language_module keys owned by the rollback (for a key check on the head side)
+ROLLBACK_KEYS = ("counterfactual_check", "rollback_mode")
+
+
+def check_rollback_cfg(lang_cfg):
+    """Check the rollback config once when the head is built, so mistakes show up before training.
+
+    lang_cfg: the language_module dict (enabled / counterfactual_check / rollback_mode ...)
+    """
+    mode = lang_cfg.get("rollback_mode", "pool")
+    assert mode in ROLLBACK_MODES, (
+        f"language_module.rollback_mode must be one of {ROLLBACK_MODES}, got {mode!r}"
+    )
+    if lang_cfg.get("counterfactual_check", False):
+        assert lang_cfg.get("enabled", False), (
+            "language_module.counterfactual_check=True needs enabled=True "
+            "(the rollback compares the 1st and 2nd pass, the 2nd pass only runs when enabled)"
+        )
 
 
 def pool_candidates(new_cls, new_reg, old_cls, old_reg, use):
