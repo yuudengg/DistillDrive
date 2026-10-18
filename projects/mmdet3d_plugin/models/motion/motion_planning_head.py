@@ -512,6 +512,14 @@ class MotionPlanningHead(BaseModule):
                         meta_idx, use = self._query_language(instance_feature, metas, use)
                     if use.any():
                         cond = self.adaln(meta_idx)  # [B] -> (g, b, a) 각 [B, 1, D]
+                        if self.counterfactual_check:
+                            # 롤백(B): 아래 _select로 덮어쓰기 전이라 plan_cls/plan_reg는 1차 결과
+                            planning_rollback = dict(
+                                classification=plan_cls,
+                                prediction=plan_reg,
+                                use=use,
+                                mode=self.rollback_mode,
+                            )
                         first = (motion_cls, motion_reg, plan_cls, plan_reg, plan_status, plan_query)
                         second = self._refine_once(
                             i,
@@ -532,14 +540,6 @@ class MotionPlanningHead(BaseModule):
                             plan_status,
                             plan_query,
                         ) = [self._select(use, s, f) for s, f in zip(second, first)]
-                        if self.counterfactual_check:
-                            # 롤백(B): 덮어쓰기 전 1차 plan_cls/plan_reg와 2차를 쓴 샘플 mask를 남김
-                            planning_rollback = dict(
-                                classification=first[2],
-                                prediction=first[3],
-                                use=use,
-                                mode=self.rollback_mode,
-                            )
                 motion_classification.append(motion_cls)
                 motion_prediction.append(motion_reg)
                 planning_classification.append(plan_cls)
