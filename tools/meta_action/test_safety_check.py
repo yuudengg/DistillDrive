@@ -237,5 +237,120 @@ check(fails(dict(enabled=True, counterfactual_check=True, rollback_mode="Pool"))
 check(fails(dict(enabled=False, counterfactual_check=True)), "counterfactual_check=True but enabled=False -> error")
 check(set(safety.ROLLBACK_KEYS) == {"counterfactual_check", "rollback_mode"}, "ROLLBACK_KEYS")
 
+# ---------- 6. random scenes: real decode() vs a simple per-sample reference ----------
+# Covers what the hand-made scene above does not: mixed commands in a batch, only some samples
+# using the 2nd pass, all 12 candidates colliding, both rollback modes, and the no-rollback path.
+#
+# Known issue in the original SparseDrive collision check (decoder.collision_mask, kept as is):
+#     ego_box[0] += offset * torch.cos(ego_box[6]); ego_box[1] += ...
+# ego_box is [N, 7] there, so this edits box rows 0 and 1 (batch sample 0, agent 0, ego mode 0,
+# steps 0-1) instead of shifting every box 0.5 m forward. The result then depends on where a sample
+# sits in the batch. Agent 0 is kept low-confidence (ignored by the check) so these rows never
+# matter here and the test only checks the rollback selection.
+print("== 6. random scenes vs per-sample reference ==")
+
+
+def ref_sample(cls, reg, old_cls, old_reg, cmd, use, mode, mot_cls, mot_reg, anchors, conf, rescore):
+    """One sample, written as plainly as possible. cls/reg: [3, M] / [3, M, T, 2] (already cumsum)."""
+    cand_cls, cand_reg = cls[cmd], reg[cmd]
+    if use:  # 2nd pass ran: also look at the 1st pass candidates of the same command
+        cand_cls = torch.cat([cand_cls, old_cls[cmd]])
+        cand_reg = torch.cat([cand_reg, old_reg[cmd]])
+    if use or rescore:
+        col = dec.collision_mask(cand_reg[None], mot_cls[None], mot_reg[None], anchors[None], conf[None])[0]
+    else:
+        col = torch.zeros(len(cand_cls), dtype=torch.bool)
+    penalty = col.clone()
+    if penalty.all():  # every candidate collides -> nothing to prefer, no penalty
+        penalty[:] = False
+    score = cand_cls - 999 * penalty.float()
+    if use and mode == "collision":
+        best_new, best_old = int(score[:M].argmax()), M + int(score[M:].argmax())
+        idx = best_old if (col[best_new] and not col[best_old]) else best_new
+    else:
+        idx = int(score.argmax())
+    score_full = cls.clone()
+    score_full[cmd] = score[:M]
+    return cand_reg[idx], idx >= M, score_full, (bool(use and col.all()), bool(use and col.any() and not col.all()))
+
+
+def random_batch(g, bs, na=8):
+    det_cls = torch.randn(bs, na, 10, generator=g) * 3 - 3  # most agents low confidence (ignored)
+    det_cls[:, 0] = -9.0  # agent 0 always ignored (see the known issue above)
+    anchors = torch.zeros(bs, na, 11)
+    anchors[..., :2] = torch.randn(bs, na, 2, generator=g) * 6 + torch.tensor([0.0, 6.0])  # around the ego path
+    anchors[..., 3:6] = (torch.rand(bs, na, 3, generator=g) * 3 + 1).log()
+    yaw = torch.rand(bs, na, generator=g) * 6.283
+    anchors[..., 6], anchors[..., 7] = yaw.sin(), yaw.cos()
+    for b in range(bs):  # some samples: a huge confident box right in front -> every candidate collides
+        if torch.rand(1, generator=g) < 0.15:
+            anchors[b, 1, :2] = torch.tensor([0.0, 1.5])
+            anchors[b, 1, 3:6] = torch.tensor([12.0, 12.0, 3.0]).log()
+            det_cls[b, 1] = 9.0
+    mot_cls = torch.randn(bs, na, 6, generator=g)
+    mot_reg = torch.randn(bs, na, 6, 12, 2, generator=g) * 0.3
+    det = {"classification": [det_cls], "prediction": [anchors]}
+    mot = {"classification": [mot_cls], "prediction": [mot_reg]}
+    step = lambda: torch.randn(bs, 1, 3 * M, T, 2, generator=g) * 0.8 + torch.tensor([0.0, 0.8])
+    new_cls, new_reg = torch.randn(bs, 1, 3 * M, generator=g), step()
+    old_cls, old_reg = torch.randn(bs, 1, 3 * M, generator=g), step()
+    use = torch.rand(bs, generator=g) < 0.6
+    # samples that did not run the 2nd pass keep the 1st pass result (head: _select), so new == old there
+    old_cls[~use], old_reg[~use] = new_cls[~use], new_reg[~use]
+    cmd = torch.randint(0, 3, (bs,), generator=g)
+    return det, mot, new_cls, new_reg, old_cls, old_reg, use, cmd
+
+
+g = torch.Generator().manual_seed(0)
+BS, TRIALS = 6, 150
+seen = dict(use=0, no_use=0, mixed_cmd_batch=0, all12_collide=0, some12_collide=0, none12_collide=0,
+            rollback_pool=0, rollback_collision=0, modes_differ=0)
+bad = []
+for trial in range(TRIALS):
+    det, mot, new_cls, new_reg, old_cls, old_reg, use, cmd = random_batch(g, BS)
+    data = {"gt_ego_fut_cmd": torch.nn.functional.one_hot(cmd, 3).float()}
+    seen["mixed_cmd_batch"] += int(len(set(cmd.tolist())) > 1)
+    base = {"classification": [new_cls], "prediction": [new_reg],
+            "anchor_queue": [torch.zeros(BS, 1, 11)], "period": torch.zeros(BS, 1)}
+    cls = new_cls.reshape(BS, 3, M)
+    reg = new_reg.reshape(BS, 3, M, T, 2).cumsum(dim=-2)
+    ocls = old_cls.reshape(BS, 3, M)
+    oreg = old_reg.reshape(BS, 3, M, T, 2).cumsum(dim=-2)
+    mot_cls = mot["classification"][-1].sigmoid()
+    conf = det["classification"][-1].sigmoid().max(dim=-1).values
+    picked = {}
+    for mode in [None, "pool", "collision"]:  # None = no rollback info (original path, use_rescore=True)
+        po = dict(base)
+        if mode is not None:
+            po["rollback"] = dict(classification=old_cls, prediction=old_reg, use=use, mode=mode)
+        out = dec.decode(det, mot, po, data)
+        for b in range(BS):
+            u = bool(use[b]) and mode is not None
+            ref_traj, ref_first, ref_score, (all12, some12) = ref_sample(
+                cls[b], reg[b], ocls[b], oreg[b], int(cmd[b]), u, mode, mot_cls[b], mot["prediction"][-1][b],
+                det["prediction"][-1][b], conf[b], rescore=True)
+            got_first = out[b].get("rollback")
+            ok_b = (torch.allclose(out[b]["final_planning"], ref_traj)
+                    and torch.allclose(out[b]["planning_score"], ref_score.sigmoid())
+                    and (got_first is None if mode is None else got_first == ref_first))
+            if not ok_b:
+                bad.append((trial, mode, b))
+            if mode is not None:
+                picked[(mode, b)] = ref_first
+                if mode == "pool" and u:
+                    seen["all12_collide"] += int(all12)
+                    seen["some12_collide"] += int(some12)
+                    seen["none12_collide"] += int(not all12 and not some12)
+                seen["rollback_" + mode] += int(ref_first)
+        if mode is None:
+            seen["use"] += int(use.sum())
+            seen["no_use"] += int((~use).sum())
+    seen["modes_differ"] += sum(picked[("pool", b)] != picked[("collision", b)] for b in range(BS))
+
+check(not bad, f"decode() == per-sample reference on {TRIALS} random batches x {BS} samples x 3 paths "
+               f"(mismatches: {len(bad)}{', first ' + str(bad[:3]) if bad else ''})")
+for k, v in seen.items():
+    check(v > 0, f"case covered: {k} = {v}")
+
 print("\nALL OK" if ok else "\nSOME FAILED")
 sys.exit(0 if ok else 1)
