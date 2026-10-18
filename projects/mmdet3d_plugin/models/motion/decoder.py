@@ -143,7 +143,7 @@ class HierarchicalPlanningDecoder(object):
                 use=first["use"],
                 mode=first.get("mode", "pool"),
             )
-        classification, final_planning, from_first = self.select(
+        classification, final_planning, record = self.select(
             det_output, motion_output, classification, prediction, data, first=first
         )
         anchor_queue = planning_output["anchor_queue"]
@@ -158,8 +158,11 @@ class HierarchicalPlanningDecoder(object):
                 "ego_period": period[i].cpu(),
                 "ego_anchor_queue": decode_box(anchor_queue[i]).cpu(),
             }
-            if from_first is not None:
-                result["rollback"] = bool(from_first[i])  # True = 1st pass trajectory was chosen
+            if record is not None:
+                # rollback: 1st pass trajectory chosen. second_pass / second_collided / first_collided:
+                # why (see safety_check.choose), e.g. rollback + second_collided + not first_collided = for safety
+                for key, value in record.items():
+                    result[key] = bool(value[i])
             output.append(result)
 
         return output
@@ -205,9 +208,9 @@ class HierarchicalPlanningDecoder(object):
                 det_confidence,
             )
             scored_cls = self.collision_penalty(pool_cls, collided)
-            final_planning, from_first = choose(scored_cls, collided, pool_reg, first["use"], first["mode"])
+            final_planning, record = choose(scored_cls, collided, pool_reg, first["use"], first["mode"])
             plan_cls_full[bs_indices, cmd] = scored_cls[:, :self.ego_fut_mode]
-            return plan_cls_full, final_planning, from_first
+            return plan_cls_full, final_planning, record
 
         # rescore
         if self.use_rescore:

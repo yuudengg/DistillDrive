@@ -150,16 +150,16 @@ col4 = torch.tensor([[False, True, False, False]])  # new mode 1 collided
 scored = torch.tensor([[1.0, 2.0 - 999, 0.5, 0.0]])
 reg4 = torch.arange(4.0)[None, :, None, None].repeat(1, 1, T, 2)
 f, ff = safety.choose(scored, col4, reg4, torch.tensor([True]), "pool")
-check(ff.tolist() == [False] and f[0, 0, 0] == 0, "pool: best non-collided overall (2nd mode 0)")
+check(ff["rollback"].tolist() == [False] and f[0, 0, 0] == 0, "pool: best non-collided overall (2nd mode 0)")
 f, ff = safety.choose(scored, col4, reg4, torch.tensor([True]), "collision")
-check(ff.tolist() == [False] and f[0, 0, 0] == 0, "collision: 2nd best is safe -> keep 2nd")
+check(ff["rollback"].tolist() == [False] and f[0, 0, 0] == 0, "collision: 2nd best is safe -> keep 2nd")
 tie = torch.tensor([[1.0, 0.0, 1.0, 0.0]])
 _, ff = safety.choose(tie, torch.zeros(1, 4, dtype=torch.bool), reg4, torch.tensor([True]), "pool")
-check(ff.tolist() == [False], "tie -> 2nd pass wins")
+check(ff["rollback"].tolist() == [False], "tie -> 2nd pass wins")
 # collision mode reads the mask, not the score drop: a small penalty still rolls back
 small = torch.tensor([[3.0 - 0.5, 0.0, 1.0, 0.0]])
 _, ff = safety.choose(small, torch.tensor([[True, True, False, False]]), reg4, torch.tensor([True]), "collision")
-check(ff.tolist() == [True], "collision: penalty of only 0.5 -> still detected, roll back")
+check(ff["rollback"].tolist() == [True], "collision: penalty of only 0.5 -> still detected, roll back")
 
 # ---------- 1b. rescore split: collision_mask + collision_penalty ----------
 print("== 1b. collision_mask / collision_penalty ==")
@@ -177,7 +177,7 @@ check(torch.equal(dec.collision_penalty(new_cls[:, 2], mask)[0], new_cls[0, 2]) 
 # ---------- 2. real decoder: no rollback key == original path ----------
 print("== 2. decoder without rollback (regression) ==")
 cls_a, fin_a, ff_a = dec.select(det_output, motion_output, new_cls.clone(), new_reg.clone(), data)
-check(ff_a is None, "no 'first' -> from_first is None")
+check(ff_a is None, "no 'first' -> no rollback record")
 check([end_y(fin_a[b]) for b in range(4)] == [GO, STOP, STOP, STOP],
       f"original rescore: sample0 all collide -> no rescore (GO), others avoid the car {[end_y(fin_a[b]) for b in range(4)]}")
 
@@ -185,7 +185,8 @@ check([end_y(fin_a[b]) for b in range(4)] == [GO, STOP, STOP, STOP],
 for mode in ["pool", "collision"]:
     print(f"== 3. decoder with rollback, mode={mode} ==")
     first = dict(classification=old_cls.clone(), prediction=old_reg.clone(), use=use, mode=mode)
-    cls_b, fin_b, ff_b = dec.select(det_output, motion_output, new_cls.clone(), new_reg.clone(), data, first=first)
+    cls_b, fin_b, rec_b = dec.select(det_output, motion_output, new_cls.clone(), new_reg.clone(), data, first=first)
+    ff_b = rec_b["rollback"]
     ys = [end_y(fin_b[b]) for b in range(4)]
     check(ff_b[0] and ys[0] == STOP, f"sample0: 2nd all collide, 1st safe -> roll back to 1st STOP (y={ys[0]})")
     check(not ff_b[1] and ys[1] == STOP, f"sample1: 2nd safe -> keep 2nd (y={ys[1]})")
@@ -214,6 +215,13 @@ planning_output["rollback"] = dict(
 out = dec.decode(det_output, motion_output, planning_output, data)
 check([o["rollback"] for o in out] == [True, False, False, True], f"rollback flags {[o['rollback'] for o in out]}")
 check(abs(float(out[0]["final_planning"][-1, 1]) - STOP) < 1e-4, "sample0 final_planning is the 1st pass STOP")
+# why each sample ended up where it did (pool): see the sample comments at the top of the scene
+reasons = [(o["second_pass"], o["second_collided"], o["first_collided"]) for o in out]
+check(reasons[0] == (True, True, False), f"sample0 record: 2nd pick collides, 1st pick safe -> rolled back for safety {reasons[0]}")
+check(reasons[1] == (True, False, True), f"sample1 record: 2nd pick safe -> kept (1st pick, all GO, would collide) {reasons[1]}")
+check(reasons[2] == (False, False, False), f"sample2 record: no 2nd pass {reasons[2]}")
+check(out[3]["rollback"] and reasons[3] == (True, False, False),
+      f"sample3 record: rollback with a safe 2nd pick -> 1st chosen for its score (pool) {reasons[3]}")
 
 # ---------- 5. check_rollback_cfg: config mistakes fail when the head is built ----------
 print("== 5. check_rollback_cfg ==")
@@ -271,7 +279,9 @@ def ref_sample(cls, reg, old_cls, old_reg, cmd, use, mode, mot_cls, mot_reg, anc
         idx = int(score.argmax())
     score_full = cls.clone()
     score_full[cmd] = score[:M]
-    return cand_reg[idx], idx >= M, score_full, (bool(use and col.all()), bool(use and col.any() and not col.all()))
+    reason = (bool(use), bool(use and col[int(score[:M].argmax())]),  # second_pass, second_collided,
+              bool(use and col[M + int(score[M:].argmax())]) if use else False)  # first_collided
+    return cand_reg[idx], idx >= M, score_full, (bool(use and col.all()), bool(use and col.any() and not col.all())), reason
 
 
 def random_batch(g, bs, na=8):
@@ -326,13 +336,14 @@ for trial in range(TRIALS):
         out = dec.decode(det, mot, po, data)
         for b in range(BS):
             u = bool(use[b]) and mode is not None
-            ref_traj, ref_first, ref_score, (all12, some12) = ref_sample(
+            ref_traj, ref_first, ref_score, (all12, some12), ref_reason = ref_sample(
                 cls[b], reg[b], ocls[b], oreg[b], int(cmd[b]), u, mode, mot_cls[b], mot["prediction"][-1][b],
                 det["prediction"][-1][b], conf[b], rescore=True)
             got_first = out[b].get("rollback")
             ok_b = (torch.allclose(out[b]["final_planning"], ref_traj)
                     and torch.allclose(out[b]["planning_score"], ref_score.sigmoid())
-                    and (got_first is None if mode is None else got_first == ref_first))
+                    and (got_first is None if mode is None else got_first == ref_first)
+                    and (mode is None or (out[b]["second_pass"], out[b]["second_collided"], out[b]["first_collided"]) == ref_reason))
             if not ok_b:
                 bad.append((trial, mode, b))
             if mode is not None:

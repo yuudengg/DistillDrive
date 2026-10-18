@@ -66,23 +66,37 @@ def choose(scored_cls, collided, pool_reg, use, mode="pool"):
     pool_reg:   [B, 2M, T, 2]
     use:        [B] bool, samples that ran the 2nd pass
 
-    Returns final [B, T, 2], from_first [B] bool (True = rolled back to 1st pass).
+    Returns final [B, T, 2] and record, a dict of [B] bool (why the trajectory was chosen):
+        rollback:        the 1st pass trajectory was chosen
+        second_pass:     the 2nd pass ran for this sample (= use)
+        second_collided: the trajectory the 2nd pass would pick on its own collides
+        first_collided:  the trajectory the 1st pass would pick on its own collides
+    The two collided flags are only set for samples with second_pass (False otherwise).
     """
     assert mode in ROLLBACK_MODES, f"rollback_mode must be one of {ROLLBACK_MODES}, got {mode}"
     bs, num_pool = scored_cls.shape
     num_new = num_pool // 2
     bs_indices = torch.arange(bs, device=scored_cls.device)
     use = use.to(device=scored_cls.device, dtype=torch.bool)
+    collided = collided.to(device=scored_cls.device, dtype=torch.bool)
+
+    # what each pass would pick on its own: safe best if any, else plain best (same as rescore)
+    best_new = scored_cls[:, :num_new].argmax(dim=-1)
+    best_old = scored_cls[:, num_new:].argmax(dim=-1) + num_new
+    new_collided = collided[bs_indices, best_new]
+    old_collided = collided[bs_indices, best_old]
 
     if mode == "pool":
         idx = scored_cls.argmax(dim=-1)
     else:
-        collided = collided.to(device=scored_cls.device, dtype=torch.bool)
-        best_new = scored_cls[:, :num_new].argmax(dim=-1)
-        best_old = scored_cls[:, num_new:].argmax(dim=-1) + num_new
-        rollback = use & collided[bs_indices, best_new] & ~collided[bs_indices, best_old]
+        rollback = use & new_collided & ~old_collided
         idx = torch.where(rollback, best_old, best_new)
 
     final = pool_reg[bs_indices, idx]
-    from_first = idx >= num_new
-    return final, from_first
+    record = dict(
+        rollback=idx >= num_new,
+        second_pass=use,
+        second_collided=use & new_collided,
+        first_collided=use & old_collided,
+    )
+    return final, record
